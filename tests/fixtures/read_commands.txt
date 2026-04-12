@@ -1,0 +1,8 @@
+cat main.py
+ls -la
+grep -r "import" .
+head -n 20 config.py
+tail -f server.log
+find . -name "*.py"
+wc -l src/blast_scope/command_parser.py
+diff a.py b.py

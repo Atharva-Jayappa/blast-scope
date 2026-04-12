@@ -1,0 +1,5 @@
+mkdir -p ./new_dir
+touch foo.py
+cp a.py b.py
+cp -r ./src ./src_backup
+tee output.log

