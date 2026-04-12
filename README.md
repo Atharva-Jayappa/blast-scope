@@ -1,4 +1,4 @@
-# blast-scope
+# Blast Scope
 
 MCP tool that scores the blast radius of shell commands before execution. It parses commands, resolves target paths against a Tree-sitter-powered dependency graph, and returns a structured risk assessment — not a blocklist, but a contextual risk score.
 
