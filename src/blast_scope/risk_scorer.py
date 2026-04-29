@@ -42,6 +42,50 @@ class RiskAssessment(TypedDict):
     recommendation: str  # "proceed" | "confirm" | "block"
 
 
+class ChainStep(TypedDict):
+    """A single command in a chained shell expression with its own risk.
+
+    Example::
+
+        {
+            "command": "rm -rf .",
+            "parsed": {...},
+            "assessment": {...},
+        }
+    """
+
+    command: str
+    parsed: ParsedCommand
+    assessment: RiskAssessment
+
+
+class ChainAssessment(TypedDict):
+    """Risk assessment for a chained command, with per-step breakdown.
+
+    The top-level ``score`` / ``severity`` / ``recommendation`` fields
+    reflect the worst single step in the chain. The ``chain`` field
+    contains every step's individual assessment.
+
+    Example::
+
+        {
+            "score": 0.9,
+            "severity": "critical",
+            "rationale": "Chain of 2 commands. Worst: rm ...",
+            "affected_nodes": [...],
+            "recommendation": "block",
+            "chain": [{...}, {...}],
+        }
+    """
+
+    score: float
+    severity: str
+    rationale: str
+    affected_nodes: list[ResolvedNode]
+    recommendation: str
+    chain: list[ChainStep]
+
+
 # ---------------------------------------------------------------------------
 # Command weight table
 # ---------------------------------------------------------------------------
@@ -247,3 +291,115 @@ def _build_rationale(
     parts.append(f"{severity.upper()} risk")
 
     return ". ".join(parts) + "."
+
+
+# ---------------------------------------------------------------------------
+# Chain scoring
+# ---------------------------------------------------------------------------
+
+
+_SEVERITY_RANK: dict[str, int] = {
+    "low": 0,
+    "medium": 1,
+    "high": 2,
+    "critical": 3,
+}
+
+
+def score_chain(
+    parsed_list: list[ParsedCommand],
+    resolutions_per_command: list[list[GraphResolution]],
+    raw_segments: list[str] | None = None,
+) -> ChainAssessment:
+    """Score a chained shell command, returning the worst-step assessment.
+
+    Each command in the chain is scored independently. The top-level fields
+    surface the worst step's score and recommendation, on the principle that
+    a chain is only as safe as its riskiest link.
+
+    Args:
+        parsed_list: Output of ``parse_command_chain()``.
+        resolutions_per_command: One list of ``GraphResolution`` per parsed
+            command, in the same order. Pass ``[]`` for commands with no
+            graph data.
+        raw_segments: Optional original string for each segment (for the
+            chain breakdown). If omitted, the parsed command name is used.
+
+    Returns:
+        A ``ChainAssessment`` with the worst step elevated to the top level
+        and every step's individual assessment in ``chain``.
+
+    Example::
+
+        >>> score_chain(parse_command_chain("cd /tmp && rm -rf ."), [[], [...]])
+        {"score": 0.9, "severity": "critical", "chain": [...], ...}
+    """
+    if not parsed_list:
+        return ChainAssessment(
+            score=0.0,
+            severity="low",
+            rationale="empty command",
+            affected_nodes=[],
+            recommendation="proceed",
+            chain=[],
+        )
+
+    if len(resolutions_per_command) != len(parsed_list):
+        # Pad with empty resolutions if mismatched
+        resolutions_per_command = list(resolutions_per_command) + [
+            [] for _ in range(len(parsed_list) - len(resolutions_per_command))
+        ]
+
+    if raw_segments is None or len(raw_segments) != len(parsed_list):
+        raw_segments = [p["command"] for p in parsed_list]
+
+    chain: list[ChainStep] = []
+    worst_idx = 0
+    worst_rank = -1
+    worst_score = -1.0
+    all_affected: list[ResolvedNode] = []
+
+    for i, (parsed, resolutions) in enumerate(zip(parsed_list, resolutions_per_command)):
+        assessment = score_risk(parsed, resolutions)
+        chain.append(
+            ChainStep(
+                command=raw_segments[i],
+                parsed=parsed,
+                assessment=assessment,
+            )
+        )
+        all_affected.extend(assessment["affected_nodes"])
+
+        rank = _SEVERITY_RANK.get(assessment["severity"], 0)
+        if rank > worst_rank or (rank == worst_rank and assessment["score"] > worst_score):
+            worst_rank = rank
+            worst_score = assessment["score"]
+            worst_idx = i
+
+    worst = chain[worst_idx]["assessment"]
+
+    if len(chain) == 1:
+        rationale = worst["rationale"]
+    else:
+        rationale = (
+            f"Chain of {len(chain)} commands. Worst step ({worst_idx + 1}/{len(chain)}): "
+            f"{worst['rationale']}"
+        )
+
+    # Deduplicate affected nodes by qualified_name
+    seen: set[str] = set()
+    deduped: list[ResolvedNode] = []
+    for node in all_affected:
+        qn = node["qualified_name"]
+        if qn not in seen:
+            seen.add(qn)
+            deduped.append(node)
+
+    return ChainAssessment(
+        score=worst["score"],
+        severity=worst["severity"],
+        rationale=rationale,
+        affected_nodes=deduped,
+        recommendation=worst["recommendation"],
+        chain=chain,
+    )

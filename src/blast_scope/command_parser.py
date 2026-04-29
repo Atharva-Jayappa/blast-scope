@@ -78,6 +78,9 @@ _SUBSHELL_PATTERN: re.Pattern[str] = re.compile(r"\$\(|`")
 # Redirect operators
 _REDIRECT_PATTERN: re.Pattern[str] = re.compile(r"(\d*)(>>?)")
 
+# Chain operators in priority order (longer matches first)
+_CHAIN_OPERATORS: tuple[str, ...] = ("&&", "||", ";", "|")
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -180,6 +183,161 @@ def parse_command(raw: str, cwd: Path | None = None) -> ParsedCommand:
         recursive=recursive,
         reversible=reversible,
     )
+
+
+def split_command_chain(raw: str) -> list[str]:
+    """Split a chained shell command into individual command strings.
+
+    Splits on ``&&``, ``||``, ``;``, and ``|``. Quoted regions and command
+    substitution (``$(...)`` / backticks) are preserved — operators inside
+    them do not split.
+
+    Example::
+
+        >>> split_command_chain("cd /tmp && rm -rf .")
+        ["cd /tmp", "rm -rf ."]
+        >>> split_command_chain("echo 'a; b'; ls")
+        ["echo 'a; b'", "ls"]
+    """
+    raw = raw.strip()
+    if not raw:
+        return []
+
+    parts: list[str] = []
+    buf: list[str] = []
+    i = 0
+    n = len(raw)
+
+    # Quote / nesting state
+    quote: str | None = None  # "'" or '"' or None
+    paren_depth = 0           # tracks $( ... )
+    in_backtick = False
+
+    while i < n:
+        c = raw[i]
+
+        # Backslash escape — copy the next char verbatim
+        if c == "\\" and i + 1 < n and quote != "'":
+            buf.append(c)
+            buf.append(raw[i + 1])
+            i += 2
+            continue
+
+        # Quote handling
+        if quote is None and not in_backtick:
+            if c == "'" or c == '"':
+                quote = c
+                buf.append(c)
+                i += 1
+                continue
+        elif quote == c:
+            quote = None
+            buf.append(c)
+            i += 1
+            continue
+
+        if quote is not None:
+            buf.append(c)
+            i += 1
+            continue
+
+        # Backtick command substitution
+        if c == "`":
+            in_backtick = not in_backtick
+            buf.append(c)
+            i += 1
+            continue
+
+        if in_backtick:
+            buf.append(c)
+            i += 1
+            continue
+
+        # $( ... ) command substitution
+        if c == "$" and i + 1 < n and raw[i + 1] == "(":
+            paren_depth += 1
+            buf.append(c)
+            buf.append(raw[i + 1])
+            i += 2
+            continue
+        if paren_depth > 0:
+            if c == "(":
+                paren_depth += 1
+            elif c == ")":
+                paren_depth -= 1
+            buf.append(c)
+            i += 1
+            continue
+
+        # Operator detection (only at top level)
+        matched_op: str | None = None
+        for op in _CHAIN_OPERATORS:
+            if raw.startswith(op, i):
+                matched_op = op
+                break
+
+        if matched_op is not None:
+            segment = "".join(buf).strip()
+            if segment:
+                parts.append(segment)
+            buf = []
+            i += len(matched_op)
+            continue
+
+        buf.append(c)
+        i += 1
+
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+
+    return parts
+
+
+def parse_command_chain(raw: str, cwd: Path | None = None) -> list[ParsedCommand]:
+    """Parse a chained shell command into a list of ParsedCommand entries.
+
+    Splits the input on shell chain operators and parses each segment.
+    A leading ``cd <path>`` segment updates the working directory used to
+    resolve subsequent commands in the chain — so ``cd /tmp && rm -rf .``
+    correctly evaluates the ``rm`` against ``/tmp``.
+
+    Args:
+        raw: The shell command string (possibly containing ``&&``, ``||``,
+             ``;``, or ``|``).
+        cwd: Working directory for the first segment. Defaults to the
+             current working directory.
+
+    Returns:
+        One ``ParsedCommand`` per segment, in chain order. Returns an
+        empty list for empty input.
+
+    Example::
+
+        >>> parse_command_chain("cd /tmp && rm -rf .", cwd=Path("/home/user"))
+        [{"command": "cd", ...}, {"command": "rm", "targets": ["/tmp"], ...}]
+    """
+    if cwd is None:
+        cwd = Path.cwd()
+
+    segments = split_command_chain(raw)
+    if not segments:
+        return []
+
+    parsed_list: list[ParsedCommand] = []
+    current_cwd = cwd
+
+    for segment in segments:
+        parsed = parse_command(segment, cwd=current_cwd)
+        parsed_list.append(parsed)
+
+        # Track cd to update cwd for following segments
+        if parsed["command"] == "cd" and parsed["targets"]:
+            new_dir = Path(parsed["targets"][0])
+            if new_dir.is_dir():
+                current_cwd = new_dir
+
+    return parsed_list
 
 
 # ---------------------------------------------------------------------------

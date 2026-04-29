@@ -100,6 +100,53 @@ class TestFullPipeline:
         assert result["score"] >= 0.0
 
 
+class TestAutoIndex:
+    """The server auto-indexes the project on first assess_command call."""
+
+    def test_get_resolver_auto_builds_when_missing(self, tmp_path: Path) -> None:
+        from blast_scope import server
+
+        # Copy the sample project into tmp_path so we don't pollute the real fixture
+        import shutil
+        project = tmp_path / "proj"
+        shutil.copytree(SAMPLE_PROJECT, project)
+
+        # Reset module-level caches to isolate this test
+        server._resolvers.clear()
+        server._indexed_roots.clear()
+
+        db_path = project / ".blast-scope" / "graph.db"
+        assert not db_path.exists()
+
+        resolver = server._get_resolver(project, auto_index=True)
+
+        # After auto-indexing, the DB should exist
+        assert db_path.exists()
+        assert str(project.resolve()) in server._indexed_roots
+
+    def test_assess_command_works_without_explicit_index(self, tmp_path: Path) -> None:
+        """First call to assess_command on a fresh project triggers auto-index."""
+        from blast_scope import server
+
+        import shutil
+        project = tmp_path / "proj"
+        shutil.copytree(SAMPLE_PROJECT, project)
+
+        server._resolvers.clear()
+        server._indexed_roots.clear()
+
+        result = server.assess_command(
+            "rm ./config.py",
+            cwd=str(project),
+            project_root=str(project),
+        )
+
+        # The graph was auto-built — config.py has importers, so score > 0
+        assert result["score"] > 0.0
+        assert "chain" in result
+        assert len(result["chain"]) == 1
+
+
 class TestRationale:
     def test_rationale_mentions_target(self, resolver: GraphResolver) -> None:
         parsed = parse_command("rm ./config.py", cwd=SAMPLE_PROJECT)

@@ -11,9 +11,12 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from blast_scope.command_parser import parse_command
+from blast_scope.command_parser import (
+    parse_command_chain,
+    split_command_chain,
+)
 from blast_scope.graph_resolver import GraphResolver
-from blast_scope.risk_scorer import score_risk
+from blast_scope.risk_scorer import score_chain
 
 logger = logging.getLogger(__name__)
 
@@ -21,10 +24,16 @@ mcp = FastMCP("blast-scope")
 
 # Cache resolvers by project root so we don't rebuild the graph on every call
 _resolvers: dict[str, GraphResolver] = {}
+# Track which roots have been indexed in this server lifetime
+_indexed_roots: set[str] = set()
 
 
-def _get_resolver(project_root: Path) -> GraphResolver:
+def _get_resolver(project_root: Path, auto_index: bool = True) -> GraphResolver:
     """Get or create a cached GraphResolver for a project root.
+
+    If ``auto_index`` is True (default), the graph is built automatically
+    on first access for a given project root, or whenever the on-disk
+    graph database is missing.
 
     Example::
 
@@ -33,7 +42,16 @@ def _get_resolver(project_root: Path) -> GraphResolver:
     key = str(project_root.resolve())
     if key not in _resolvers:
         _resolvers[key] = GraphResolver(project_root)
-    return _resolvers[key]
+
+    resolver = _resolvers[key]
+
+    if auto_index and key not in _indexed_roots:
+        if not resolver._db_path.exists():
+            logger.info("Auto-indexing project graph at %s", project_root)
+            resolver.build_graph()
+        _indexed_roots.add(key)
+
+    return resolver
 
 
 @mcp.tool()
@@ -44,51 +62,58 @@ def assess_command(
 ) -> dict:
     """Assess the blast radius of a shell command.
 
-    Parses the command, resolves target paths against the dependency graph,
-    and returns a structured risk assessment with a score from 0.0 to 1.0.
+    Splits chained commands on ``&&``, ``||``, ``;``, and ``|``, then
+    parses, resolves, and scores each segment independently. The top-level
+    fields surface the worst step's score and recommendation; the ``chain``
+    field contains every step's individual breakdown.
+
+    When ``project_root`` is provided and no graph database exists yet,
+    the graph is built automatically on the first call. Use
+    ``index_project`` to force a rebuild.
 
     Args:
         command: Raw shell command string to analyze.
         cwd: Working directory for resolving relative paths.
              Defaults to the server's current working directory.
         project_root: Root directory of the project for graph-based scoring.
-                      If provided and the project has been indexed, the
-                      assessment includes dependency-aware risk scoring.
+                      If provided, the graph is auto-built when missing.
 
     Returns:
-        Structured risk assessment including parsed command, risk score,
-        severity level, and recommendation.
+        Structured risk assessment with worst-step score, severity,
+        recommendation, and per-step chain breakdown.
 
     Example::
 
-        assess_command("rm -rf ./config", cwd="/project", project_root="/project")
+        assess_command("cd /tmp && rm -rf .", cwd="/home/user", project_root="/project")
     """
     working_dir = Path(cwd) if cwd else Path.cwd()
-    parsed = parse_command(command, cwd=working_dir)
+    segments = split_command_chain(command)
+    parsed_list = parse_command_chain(command, cwd=working_dir)
 
-    resolutions = []
+    resolutions_per_command: list = []
     if project_root:
         root = Path(project_root)
-        resolver = _get_resolver(root)
-        for target in parsed["targets"]:
-            resolution = resolver.resolve_path(Path(target))
-            resolutions.append(resolution)
+        resolver = _get_resolver(root, auto_index=True)
+        for parsed in parsed_list:
+            cmd_resolutions = []
+            for target in parsed["targets"]:
+                cmd_resolutions.append(resolver.resolve_path(Path(target)))
+            resolutions_per_command.append(cmd_resolutions)
+    else:
+        resolutions_per_command = [[] for _ in parsed_list]
 
-    assessment = score_risk(parsed, resolutions)
+    assessment = score_chain(parsed_list, resolutions_per_command, raw_segments=segments)
 
-    return {
-        "parsed": dict(parsed),
-        **assessment,
-    }
+    return dict(assessment)
 
 
 @mcp.tool()
 def index_project(project_root: str) -> dict:
     """Build or refresh the dependency graph for a project.
 
-    Call this once before using assess_command with a project_root to enable
-    graph-based risk scoring. The graph is cached — subsequent calls to
-    assess_command will reuse the built graph.
+    Forces a graph rebuild for the given project root. Normally not
+    required — ``assess_command`` auto-builds the graph on first use —
+    but useful to refresh after a large code change.
 
     Args:
         project_root: Absolute path to the project root directory.
@@ -101,8 +126,10 @@ def index_project(project_root: str) -> dict:
         index_project("/home/user/my-project")
     """
     root = Path(project_root)
-    resolver = _get_resolver(root)
+    # auto_index=False: we're about to do it explicitly
+    resolver = _get_resolver(root, auto_index=False)
     resolver.build_graph()
+    _indexed_roots.add(str(root.resolve()))
     return {"status": "indexed", "project_root": str(root.resolve())}
 
 
