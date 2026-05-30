@@ -11,11 +11,13 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+from blast_scope import consequences as consequence_engine
 from blast_scope.command_parser import (
     parse_command_chain,
     split_command_chain,
 )
 from blast_scope.graph_resolver import GraphResolver
+from blast_scope.recoverability import Recoverability, classify_path, clear_cache
 from blast_scope.risk_scorer import score_chain
 
 logger = logging.getLogger(__name__)
@@ -102,9 +104,48 @@ def assess_command(
     else:
         resolutions_per_command = [[] for _ in parsed_list]
 
-    assessment = score_chain(parsed_list, resolutions_per_command, raw_segments=segments)
+    # Recoverability axis: per command, classify each target and keep the
+    # worst (least recoverable) — that's what gates the safety of the step.
+    recoverability_per_command = [
+        _worst_recoverability(parsed["targets"]) for parsed in parsed_list
+    ]
+
+    # Out-of-graph consequences (VCS history, infra/deploy, config-by-path)
+    # per command, gathered against the working dir and project root.
+    root_path = Path(project_root) if project_root else None
+    consequences_per_command = [
+        consequence_engine.gather(parsed, segment, working_dir, root_path)
+        for parsed, segment in zip(parsed_list, segments)
+    ]
+
+    assessment = score_chain(
+        parsed_list,
+        resolutions_per_command,
+        raw_segments=segments,
+        recoverability_per_command=recoverability_per_command,
+        consequences_per_command=consequences_per_command,
+    )
 
     return dict(assessment)
+
+
+def _worst_recoverability(targets: list[str]) -> Recoverability | None:
+    """Classify each target and return the least-recoverable one.
+
+    Returns ``None`` when a command has no resolved targets, so the scorer
+    falls back to the parser's coarse reversibility flag.
+
+    Example::
+
+        >>> _worst_recoverability(["/proj/.env", "/proj/README.md"])["category"]
+        'secret'
+    """
+    worst: Recoverability | None = None
+    for target in targets:
+        rec = classify_path(Path(target))
+        if worst is None or rec["irrecoverability"] > worst["irrecoverability"]:
+            worst = rec
+    return worst
 
 
 @mcp.tool()
@@ -128,8 +169,10 @@ def index_project(project_root: str) -> dict:
     root = Path(project_root)
     # auto_index=False: we're about to do it explicitly
     resolver = _get_resolver(root, auto_index=False)
-    resolver.build_graph()
+    resolver.build_graph(force=True)
     _indexed_roots.add(str(root.resolve()))
+    # Git/recoverability state may have changed alongside the code — drop it.
+    clear_cache()
     return {"status": "indexed", "project_root": str(root.resolve())}
 
 

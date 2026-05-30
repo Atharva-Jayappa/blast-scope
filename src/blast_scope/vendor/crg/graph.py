@@ -313,6 +313,17 @@ class GraphStore:
         ).fetchall()
         return [r["file_path"] for r in rows]
 
+    def get_file_hashes(self) -> dict[str, str]:
+        """Return ``{file_path: file_hash}`` for every indexed file.
+
+        Used by incremental indexing to skip files whose content hash is
+        unchanged. Keyed on the ``File`` node, which carries the file's hash.
+        """
+        rows = self._conn.execute(
+            "SELECT file_path, file_hash FROM nodes WHERE kind = 'File'"
+        ).fetchall()
+        return {r["file_path"]: (r["file_hash"] or "") for r in rows}
+
     def search_nodes(self, query: str, limit: int = 20) -> list[GraphNode]:
         """Keyword search across node names with multi-word AND logic.
 
@@ -472,6 +483,72 @@ class GraphStore:
             "truncated": truncated,
             "total_impacted": total_impacted,
         }
+
+    def get_reverse_impact_sql(
+        self,
+        changed_files: list[str],
+        max_depth: int = MAX_IMPACT_DEPTH,
+        max_nodes: int = MAX_IMPACT_NODES,
+    ) -> dict[str, Any]:
+        """Find nodes that *depend on* the changed files (reverse dependencies).
+
+        Unlike :meth:`get_impact_radius_sql` (which traverses edges in both
+        directions), this follows edges only from ``target`` back to
+        ``source`` — i.e. "who would break if this were deleted." Depth is
+        tracked per node (1 = direct dependent).
+
+        Returns dict with:
+          - ``changed_nodes``: seed nodes in the changed files
+          - ``dependents``: list of ``(GraphNode, depth)`` ordered by depth
+        """
+        empty = {"changed_nodes": [], "dependents": []}
+        if not changed_files:
+            return empty
+
+        seeds: set[str] = set()
+        for f in changed_files:
+            for n in self.get_nodes_by_file(f):
+                seeds.add(n.qualified_name)
+        if not seeds:
+            return empty
+
+        self._conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS _rimpact_seeds (qn TEXT PRIMARY KEY)"
+        )
+        self._conn.execute("DELETE FROM _rimpact_seeds")
+        seed_list = list(seeds)
+        for i in range(0, len(seed_list), 450):
+            batch = seed_list[i:i + 450]
+            placeholders = ",".join("(?)" for _ in batch)
+            self._conn.execute(  # nosec B608
+                f"INSERT OR IGNORE INTO _rimpact_seeds (qn) VALUES {placeholders}", batch
+            )
+
+        cte_sql = """
+        WITH RECURSIVE dependents(node_qn, depth) AS (
+            SELECT qn, 0 FROM _rimpact_seeds
+            UNION
+            SELECT e.source_qualified, d.depth + 1
+            FROM dependents d
+            JOIN edges e ON e.target_qualified = d.node_qn
+            WHERE d.depth < ?
+        )
+        SELECT node_qn, MIN(depth) AS depth
+        FROM dependents
+        GROUP BY node_qn
+        ORDER BY depth
+        LIMIT ?
+        """
+        rows = self._conn.execute(cte_sql, (max_depth, max_nodes + len(seeds))).fetchall()
+
+        depth_by_qn = {r[0]: r[1] for r in rows if r[0] not in seeds}
+        changed_nodes = self._batch_get_nodes(seeds)
+        dep_nodes = self._batch_get_nodes(set(depth_by_qn))
+        dependents = sorted(
+            ((n, depth_by_qn[n.qualified_name]) for n in dep_nodes),
+            key=lambda pair: pair[1],
+        )
+        return {"changed_nodes": changed_nodes, "dependents": dependents[:max_nodes]}
 
     def get_subgraph(self, qualified_names: list[str]) -> dict[str, Any]:
         """Extract a subgraph containing the specified nodes and their connecting edges."""

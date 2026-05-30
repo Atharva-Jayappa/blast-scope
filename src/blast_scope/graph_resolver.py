@@ -9,14 +9,19 @@ target paths and the structural risk score.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import TypedDict
 
+from blast_scope import centrality
 from blast_scope.vendor.crg import CodeParser, GraphStore, NodeInfo, EdgeInfo
 
 logger = logging.getLogger(__name__)
+
+# Metadata key under which the file-level PageRank map is cached in the graph DB.
+_PAGERANK_META_KEY = "pagerank_by_file"
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +59,11 @@ class GraphResolution(TypedDict):
             "affected_nodes": [...],
             "in_degree": 2,
             "total_affected": 3,
+            "importance": 1.0,
         }
+
+    ``importance`` is the target file's normalized PageRank centrality in the
+    dependency graph (0.0 = peripheral, 1.0 = the most depended-upon file).
     """
 
     target_path: str
@@ -62,6 +71,7 @@ class GraphResolution(TypedDict):
     affected_nodes: list[ResolvedNode]
     in_degree: int
     total_affected: int
+    importance: float
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +102,7 @@ class GraphResolver:
         self._db_path = db_path
         self._parser = CodeParser()
         self._store: GraphStore | None = None
+        self._pagerank: dict[str, float] | None = None
 
     def _get_store(self) -> GraphStore:
         """Lazily initialize the graph store."""
@@ -99,26 +110,37 @@ class GraphResolver:
             self._store = GraphStore(self._db_path)
         return self._store
 
-    def build_graph(self) -> None:
-        """Parse all source files in the project and populate the graph.
+    def build_graph(self, force: bool = False) -> None:
+        """Parse the project's source files and populate the graph.
 
-        Walks the project tree, parses each recognized source file with
-        Tree-sitter, and inserts the resulting nodes and edges into the
-        SQLite graph store.
+        Incremental by default: files whose content hash is unchanged since
+        the last build are skipped, and files that have disappeared are
+        pruned. Pass ``force=True`` to re-parse everything. After (re)building,
+        weighted PageRank centrality is recomputed and cached.
+
+        Args:
+            force: Re-parse every file regardless of cached hashes.
 
         Example::
 
             >>> resolver = GraphResolver(Path("/project"))
-            >>> resolver.build_graph()
+            >>> resolver.build_graph()          # first run: parses everything
+            >>> resolver.build_graph()          # later: only changed files
         """
         store = self._get_store()
+        existing_hashes = store.get_file_hashes()
+        seen: set[str] = set()
 
         for source_file in self._walk_sources():
             rel_path = self._to_graph_path(source_file)
+            seen.add(rel_path)
             try:
                 file_hash = hashlib.md5(
                     source_file.read_bytes(), usedforsecurity=False
                 ).hexdigest()
+                # Skip unchanged files unless a full rebuild was requested.
+                if not force and existing_hashes.get(rel_path) == file_hash:
+                    continue
                 nodes, edges = self._parser.parse_file(source_file)
                 # Normalize file paths in nodes and edges to use relative POSIX paths
                 normalized_nodes = self._normalize_nodes(nodes, source_file)
@@ -128,6 +150,44 @@ class GraphResolver:
                 )
             except Exception:
                 logger.warning("Failed to parse %s", source_file, exc_info=True)
+
+        # Prune files that no longer exist on disk.
+        for stale in existing_hashes.keys() - seen:
+            store.remove_file_data(stale)
+
+        self._recompute_pagerank(store)
+
+    def _recompute_pagerank(self, store: GraphStore) -> None:
+        """Compute weighted PageRank over all edges and cache it per file.
+
+        Node-level centrality is aggregated to the file level (summed, then
+        normalized so the most central file is 1.0) and persisted in the
+        graph DB's metadata so scoring stays a cheap lookup.
+        """
+        triples = [
+            (e.source_qualified, e.target_qualified, e.kind)
+            for e in store.get_all_edges()
+        ]
+        node_scores = centrality.pagerank(triples)
+
+        file_scores: dict[str, float] = {}
+        for qn, score in node_scores.items():
+            file_path = qn.split("::", 1)[0]
+            file_scores[file_path] = file_scores.get(file_path, 0.0) + score
+
+        peak = max(file_scores.values(), default=0.0)
+        if peak > 0.0:
+            file_scores = {f: s / peak for f, s in file_scores.items()}
+
+        store.set_metadata(_PAGERANK_META_KEY, json.dumps(file_scores))
+        self._pagerank = file_scores
+
+    def _pagerank_by_file(self) -> dict[str, float]:
+        """Lazily load the cached file-level PageRank map."""
+        if self._pagerank is None:
+            raw = self._get_store().get_metadata(_PAGERANK_META_KEY)
+            self._pagerank = json.loads(raw) if raw else {}
+        return self._pagerank
 
     def resolve_path(self, target: Path) -> GraphResolution:
         """Resolve a single filesystem path to its graph impact.
@@ -166,20 +226,18 @@ class GraphResolver:
         if not nodes_in_file:
             return _empty_resolution(str(target))
 
-        # Get impact radius — all nodes affected by changes to this file
-        impact = store.get_impact_radius_sql([rel_path])
+        # Reverse-dependency impact — nodes that would break if this file were
+        # deleted, with true per-node depth (1 = direct dependent).
+        impact = store.get_reverse_impact_sql([rel_path])
 
-        # Build affected nodes list from impacted nodes (excluding the seed nodes)
         affected: list[ResolvedNode] = []
-        seed_qns = {n.qualified_name for n in impact["changed_nodes"]}
-
-        for node in impact["impacted_nodes"]:
+        for node, depth in impact["dependents"]:
             affected.append(
                 ResolvedNode(
                     qualified_name=node.qualified_name,
                     kind=node.kind,
                     file_path=node.file_path,
-                    depth=1,  # CTE doesn't expose per-node depth easily
+                    depth=depth,
                 )
             )
 
@@ -198,6 +256,7 @@ class GraphResolver:
             affected_nodes=affected,
             in_degree=in_degree,
             total_affected=len(affected),
+            importance=self._pagerank_by_file().get(rel_path, 0.0),
         )
 
     def resolve_paths(self, targets: list[Path]) -> list[GraphResolution]:
@@ -294,12 +353,14 @@ class GraphResolver:
         all_nodes: list[str] = []
         all_affected: list[ResolvedNode] = []
         total_in_degree = 0
+        max_importance = 0.0
 
         for source_file in self._walk_sources(target):
             resolution = self.resolve_path(source_file)
             all_nodes.extend(resolution["nodes_in_file"])
             all_affected.extend(resolution["affected_nodes"])
             total_in_degree += resolution["in_degree"]
+            max_importance = max(max_importance, resolution["importance"])
 
         # Deduplicate affected nodes
         seen: set[str] = set()
@@ -315,6 +376,7 @@ class GraphResolver:
             affected_nodes=unique_affected,
             in_degree=total_in_degree,
             total_affected=len(unique_affected),
+            importance=max_importance,
         )
 
     def _walk_sources(self, root: Path | None = None) -> list[Path]:
@@ -363,4 +425,5 @@ def _empty_resolution(target_path: str) -> GraphResolution:
         affected_nodes=[],
         in_degree=0,
         total_affected=0,
+        importance=0.0,
     )

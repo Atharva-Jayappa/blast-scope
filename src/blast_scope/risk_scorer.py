@@ -10,8 +10,11 @@ import logging
 from pathlib import Path
 from typing import TypedDict
 
+from blast_scope.command_effects import command_weight as _effect_weight
 from blast_scope.command_parser import ParsedCommand
+from blast_scope.consequences import Consequence, max_floor
 from blast_scope.graph_resolver import GraphResolution, ResolvedNode
+from blast_scope.recoverability import Recoverability
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +43,8 @@ class RiskAssessment(TypedDict):
     rationale: str
     affected_nodes: list[ResolvedNode]
     recommendation: str  # "proceed" | "confirm" | "block"
+    recoverability: str  # category from recoverability.classify_path, or "unknown"
+    evidence: list[str]  # short, human-readable reasons behind the score
 
 
 class ChainStep(TypedDict):
@@ -83,46 +88,14 @@ class ChainAssessment(TypedDict):
     rationale: str
     affected_nodes: list[ResolvedNode]
     recommendation: str
+    recoverability: str
+    evidence: list[str]
     chain: list[ChainStep]
 
 
 # ---------------------------------------------------------------------------
-# Command weight table
+# Scoring constants
 # ---------------------------------------------------------------------------
-
-COMMAND_WEIGHTS: dict[str, float] = {
-    # Destructive
-    "rm": 0.9,
-    "rmdir": 0.7,
-    "truncate": 0.8,
-    "dd": 1.0,
-    "mkfs": 1.0,
-    "shred": 1.0,
-    # Modifying
-    "mv": 0.6,
-    "chmod": 0.5,
-    "chown": 0.5,
-    "sed": 0.4,
-    # Additive
-    "touch": 0.1,
-    "mkdir": 0.1,
-    "cp": 0.2,
-    # Read
-    "cat": 0.0,
-    "head": 0.0,
-    "tail": 0.0,
-    "less": 0.0,
-    "more": 0.0,
-    "grep": 0.0,
-    "find": 0.0,
-    "ls": 0.0,
-    "wc": 0.0,
-    "diff": 0.0,
-    "file": 0.0,
-    "stat": 0.0,
-}
-
-DEFAULT_WEIGHT: float = 0.3
 
 # In-degree normalization ceiling (10+ importers = max risk)
 _IN_DEGREE_CEILING: int = 10
@@ -140,15 +113,34 @@ _BASELINE_IN_DEGREE_OUTSIDE: float = 0.05
 def score_risk(
     parsed: ParsedCommand,
     resolutions: list[GraphResolution],
+    recoverability: Recoverability | None = None,
+    consequences: list[Consequence] | None = None,
 ) -> RiskAssessment:
-    """Combine parser output and graph resolution into a risk score.
+    """Combine parser output, graph resolution, and recoverability into a score.
 
-    Formula: ``score = command_weight * normalized_in_degree * (1 / reversibility_factor)``
+    Two orthogonal axes drive the result:
+
+    - **blast radius** — ``command_weight × normalized_in_degree``: how much
+      depends on the target and how dangerous the verb is.
+    - **reversibility** — can the change be undone? When ``recoverability`` is
+      supplied it drives this axis (git history, regenerable artifacts, secrets);
+      otherwise the parser's coarse ``reversible`` flag is used.
+
+    Formula: ``score = command_weight × normalized_in_degree × (1 / reversibility_factor)``,
+    then category floors/caps are applied (a secret is high-risk even with zero
+    importers; a regenerable artifact stays low even if widely imported).
 
     Args:
         parsed: Output from ``parse_command()``.
         resolutions: Output from ``GraphResolver.resolve_paths()``.
                      May be empty if no graph data is available.
+        recoverability: Optional worst-case recoverability of the targets,
+                     from ``recoverability.classify_path``. When omitted the
+                     scorer falls back to the parser's ``reversible`` flag.
+        consequences: Optional out-of-graph consequences (VCS/infra/config)
+                     from ``consequences.gather``. Each raises the score to at
+                     least its floor — applied before recoverability caps, so a
+                     regenerable/absent target still caps low.
 
     Returns:
         A ``RiskAssessment`` with score, severity, rationale, and recommendation.
@@ -158,7 +150,7 @@ def score_risk(
         >>> score_risk(parse_command("rm -rf ./config"), [config_resolution])
         {"score": 0.9, "severity": "critical", ...}
     """
-    command_weight = COMMAND_WEIGHTS.get(parsed["command"], DEFAULT_WEIGHT)
+    weight = _effect_weight(parsed["command"], parsed["flags"], parsed["intent"])
 
     # Aggregate in-degree from all resolutions
     total_in_degree = sum(r["in_degree"] for r in resolutions)
@@ -175,16 +167,48 @@ def score_risk(
         # No graph data — use a baseline
         normalized_in_degree = _BASELINE_IN_DEGREE_PROJECT
 
-    # Reversibility factor
-    reversibility_factor = 1.0
-    if parsed["reversible"]:
-        reversibility_factor = 2.0
+    # Structural blast-radius signal. Raw in-degree is a local count; PageRank
+    # importance is a global, edge-type-weighted centrality. A file is
+    # high-blast-radius if EITHER many things import it directly OR it is
+    # globally central — so take the stronger of the two signals.
+    importance = max((r.get("importance", 0.0) for r in resolutions), default=0.0)
+    structural = max(normalized_in_degree, importance)
+
+    # Reversibility axis. With recoverability data, irrecoverability scales the
+    # factor continuously: fully recoverable (irr 0) halves risk like the old
+    # `reversible` flag; gone-for-good (irr 1) multiplies it ~4×.
+    if recoverability is not None:
+        irr = recoverability["irrecoverability"]
+        reversibility_factor = max(0.25, 2.0 - 1.75 * irr)
+    else:
+        reversibility_factor = 2.0 if parsed["reversible"] else 1.0
     if parsed["recursive"]:
         reversibility_factor *= 0.5
 
     # Raw score
-    raw_score = command_weight * normalized_in_degree * (1.0 / reversibility_factor)
+    raw_score = weight * structural * (1.0 / reversibility_factor)
     score = max(0.0, min(1.0, raw_score))
+
+    # Out-of-graph consequences (VCS history loss, infra/deploy reach, config
+    # files loaded by path) raise the score to their floor. Applied BEFORE the
+    # recoverability caps below so a regenerable/absent target — node_modules,
+    # a path that doesn't exist — still caps low even if something references it.
+    if consequences and weight > 0.0:
+        score = max(score, max_floor(consequences))
+
+    # Category floors/caps — the reversibility axis on its own can't express
+    # "irreplaceable regardless of importers" or "always cheap to rebuild".
+    # Only applied to commands that actually change state (weight > 0).
+    if recoverability is not None and weight > 0.0:
+        cat = recoverability["category"]
+        if cat == "absent":
+            score = min(score, 0.1)
+        elif cat == "regenerable":
+            score = min(score, 0.15)
+        elif cat == "secret":
+            score = max(score, 0.85)
+        elif cat in ("precious_data", "gitignored"):
+            score = max(score, 0.6)
 
     # Severity mapping
     severity = _score_to_severity(score)
@@ -197,8 +221,11 @@ def score_risk(
     for r in resolutions:
         affected_nodes.extend(r["affected_nodes"])
 
-    # Build rationale
+    # Build rationale + evidence
     rationale = _build_rationale(parsed, resolutions, score, severity, has_graph_data)
+    evidence = _build_evidence(parsed, resolutions, recoverability, has_graph_data, importance)
+    if consequences and weight > 0.0:
+        evidence.extend(c.evidence for c in consequences)
 
     return RiskAssessment(
         score=round(score, 3),
@@ -206,6 +233,8 @@ def score_risk(
         rationale=rationale,
         affected_nodes=affected_nodes,
         recommendation=recommendation,
+        recoverability=recoverability["category"] if recoverability else "unknown",
+        evidence=evidence,
     )
 
 
@@ -293,6 +322,44 @@ def _build_rationale(
     return ". ".join(parts) + "."
 
 
+def _build_evidence(
+    parsed: ParsedCommand,
+    resolutions: list[GraphResolution],
+    recoverability: Recoverability | None,
+    has_graph_data: bool,
+    importance: float = 0.0,
+) -> list[str]:
+    """Collect the discrete signals behind a score, as short strings.
+
+    Unlike the prose ``rationale``, this is a machine-friendly list an agent
+    or UI can render as bullet points.
+
+    Example::
+
+        >>> _build_evidence(parsed, resolutions, recoverability, True, 0.9)
+        ["3 importer(s), 5 affected node(s)", "high centrality ...", "git-tracked ..."]
+    """
+    evidence: list[str] = []
+
+    if has_graph_data:
+        total_in = sum(r["in_degree"] for r in resolutions)
+        total_affected = sum(r["total_affected"] for r in resolutions)
+        evidence.append(f"{total_in} importer(s), {total_affected} affected node(s)")
+
+    if importance >= 0.5:
+        evidence.append(
+            f"high centrality (PageRank {importance:.2f}) — a hub other code routes through"
+        )
+
+    if recoverability is not None:
+        evidence.append(recoverability["reason"])
+
+    if parsed["recursive"]:
+        evidence.append("recursive — applies to every file underneath")
+
+    return evidence
+
+
 # ---------------------------------------------------------------------------
 # Chain scoring
 # ---------------------------------------------------------------------------
@@ -310,6 +377,8 @@ def score_chain(
     parsed_list: list[ParsedCommand],
     resolutions_per_command: list[list[GraphResolution]],
     raw_segments: list[str] | None = None,
+    recoverability_per_command: list[Recoverability | None] | None = None,
+    consequences_per_command: list[list[Consequence] | None] | None = None,
 ) -> ChainAssessment:
     """Score a chained shell command, returning the worst-step assessment.
 
@@ -341,6 +410,8 @@ def score_chain(
             rationale="empty command",
             affected_nodes=[],
             recommendation="proceed",
+            recoverability="unknown",
+            evidence=[],
             chain=[],
         )
 
@@ -349,6 +420,12 @@ def score_chain(
         resolutions_per_command = list(resolutions_per_command) + [
             [] for _ in range(len(parsed_list) - len(resolutions_per_command))
         ]
+
+    if recoverability_per_command is None or len(recoverability_per_command) != len(parsed_list):
+        recoverability_per_command = [None] * len(parsed_list)
+
+    if consequences_per_command is None or len(consequences_per_command) != len(parsed_list):
+        consequences_per_command = [None] * len(parsed_list)
 
     if raw_segments is None or len(raw_segments) != len(parsed_list):
         raw_segments = [p["command"] for p in parsed_list]
@@ -360,7 +437,12 @@ def score_chain(
     all_affected: list[ResolvedNode] = []
 
     for i, (parsed, resolutions) in enumerate(zip(parsed_list, resolutions_per_command)):
-        assessment = score_risk(parsed, resolutions)
+        assessment = score_risk(
+            parsed,
+            resolutions,
+            recoverability_per_command[i],
+            consequences_per_command[i],
+        )
         chain.append(
             ChainStep(
                 command=raw_segments[i],
@@ -401,5 +483,7 @@ def score_chain(
         rationale=rationale,
         affected_nodes=deduped,
         recommendation=worst["recommendation"],
+        recoverability=worst["recoverability"],
+        evidence=worst["evidence"],
         chain=chain,
     )

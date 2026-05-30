@@ -56,10 +56,24 @@ class TestBasicParsing:
         assert result["command"] == "chmod"
         assert result["intent"] == "destructive"
 
-    def test_git_is_unknown(self, tmp_path: Path) -> None:
+    def test_git_push_is_additive(self, tmp_path: Path) -> None:
+        # A plain push adds commits to a remote — low risk, not destructive.
         result = parse_command("git push origin main", cwd=tmp_path)
         assert result["command"] == "git"
-        assert result["intent"] == "unknown"
+        assert result["intent"] == "additive"
+
+    def test_git_force_push_is_destructive(self, tmp_path: Path) -> None:
+        result = parse_command("git push --force origin main", cwd=tmp_path)
+        assert result["command"] == "git"
+        assert result["intent"] == "destructive"
+
+    def test_git_reset_hard_is_destructive(self, tmp_path: Path) -> None:
+        result = parse_command("git reset --hard HEAD~1", cwd=tmp_path)
+        assert result["intent"] == "destructive"
+
+    def test_git_status_is_read(self, tmp_path: Path) -> None:
+        result = parse_command("git status", cwd=tmp_path)
+        assert result["intent"] == "read"
 
 
 # ---------------------------------------------------------------------------
