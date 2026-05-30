@@ -12,6 +12,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 from blast_scope import consequences as consequence_engine
+from blast_scope import snapshot as snapshot_engine
 from blast_scope.command_parser import (
     parse_command_chain,
     split_command_chain,
@@ -88,19 +89,38 @@ def assess_command(
 
         assess_command("cd /tmp && rm -rf .", cwd="/home/user", project_root="/project")
     """
+    return assess(command, cwd=cwd, project_root=project_root, auto_index=True)
+
+
+def assess(
+    command: str,
+    cwd: str | None = None,
+    project_root: str | None = None,
+    auto_index: bool = True,
+) -> dict:
+    """Score a (possibly chained) shell command. Pure of MCP plumbing.
+
+    Shared by the ``assess_command`` MCP tool and the PreToolUse hook. Graph
+    scoring is used only when ``project_root`` is given; ``auto_index`` controls
+    whether a missing graph is built (the tool builds it; the hook does not, to
+    keep per-command latency low).
+
+    Example::
+
+        >>> assess("rm -rf ./config", cwd="/proj", project_root="/proj")["severity"]
+        'critical'
+    """
     working_dir = Path(cwd) if cwd else Path.cwd()
     segments = split_command_chain(command)
     parsed_list = parse_command_chain(command, cwd=working_dir)
 
     resolutions_per_command: list = []
-    if project_root:
-        root = Path(project_root)
-        resolver = _get_resolver(root, auto_index=True)
+    if project_root and (auto_index or _graph_exists(Path(project_root))):
+        resolver = _get_resolver(Path(project_root), auto_index=auto_index)
         for parsed in parsed_list:
-            cmd_resolutions = []
-            for target in parsed["targets"]:
-                cmd_resolutions.append(resolver.resolve_path(Path(target)))
-            resolutions_per_command.append(cmd_resolutions)
+            resolutions_per_command.append(
+                [resolver.resolve_path(Path(t)) for t in parsed["targets"]]
+            )
     else:
         resolutions_per_command = [[] for _ in parsed_list]
 
@@ -127,6 +147,11 @@ def assess_command(
     )
 
     return dict(assessment)
+
+
+def _graph_exists(project_root: Path) -> bool:
+    """True if a prebuilt graph DB exists for ``project_root`` (no build)."""
+    return (project_root / ".blast-scope" / "graph.db").exists()
 
 
 def _worst_recoverability(targets: list[str]) -> Recoverability | None:
@@ -174,6 +199,63 @@ def index_project(project_root: str) -> dict:
     # Git/recoverability state may have changed alongside the code — drop it.
     clear_cache()
     return {"status": "indexed", "project_root": str(root.resolve())}
+
+
+@mcp.tool()
+def list_snapshots(project_root: str) -> dict:
+    """List undo snapshots captured before risky commands, newest first.
+
+    Snapshots are taken automatically by the PreToolUse hook before a
+    medium-or-higher risk command and stored under
+    ``<project_root>/.blast-scope/snapshots``.
+
+    Args:
+        project_root: The project root the snapshots were taken under.
+
+    Returns:
+        ``{"snapshots": [{id, created, reason, paths}, ...]}``.
+
+    Example::
+
+        list_snapshots("/home/user/my-project")
+    """
+    snaps = snapshot_engine.list_snapshots(Path(project_root))
+    return {
+        "snapshots": [
+            {
+                "id": s["id"],
+                "created": s["created"],
+                "reason": s["reason"],
+                "paths": [e["original"] for e in s["entries"]],
+            }
+            for s in snaps
+        ]
+    }
+
+
+@mcp.tool()
+def restore_snapshot(snapshot_id: str, project_root: str) -> dict:
+    """Undo a risky command by restoring a snapshot's files in place.
+
+    Overwrites whatever currently exists at each snapshotted path with the
+    archived copy. Use ``list_snapshots`` to find the id.
+
+    Args:
+        snapshot_id: The snapshot id to restore.
+        project_root: The project root the snapshot was taken under.
+
+    Returns:
+        ``{"status": "restored", "paths": [...]}`` or an ``error`` entry.
+
+    Example::
+
+        restore_snapshot("20260530T101500-a1b2c3", "/home/user/my-project")
+    """
+    try:
+        restored = snapshot_engine.restore_snapshot(snapshot_id, root=Path(project_root))
+    except FileNotFoundError as exc:
+        return {"status": "error", "error": str(exc)}
+    return {"status": "restored", "snapshot_id": snapshot_id, "paths": restored}
 
 
 def main() -> None:
