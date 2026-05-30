@@ -14,6 +14,8 @@ import subprocess
 from pathlib import Path
 from typing import TypedDict
 
+from blast_scope.command_effects import canonicalize, classify_effect
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -48,26 +50,6 @@ class ParsedCommand(TypedDict):
 # Intent classification tables
 # ---------------------------------------------------------------------------
 
-DESTRUCTIVE_COMMANDS: frozenset[str] = frozenset(
-    {"rm", "rmdir", "truncate", "dd", "mkfs", "shred"}
-)
-
-ADDITIVE_COMMANDS: frozenset[str] = frozenset(
-    {"touch", "mkdir", "cp", "tee", "install"}
-)
-
-READ_COMMANDS: frozenset[str] = frozenset(
-    {"cat", "head", "tail", "less", "more", "grep", "find", "ls", "wc", "diff", "file", "stat"}
-)
-
-MIXED_COMMANDS: dict[str, str] = {
-    "mv": "destructive",
-    "chmod": "destructive",
-    "chown": "destructive",
-    "sed": "destructive",
-    "git": "unknown",
-}
-
 # Flags that indicate recursive operation
 _RECURSIVE_LONG_FLAGS: frozenset[str] = frozenset({"--recursive"})
 _RECURSIVE_SHORT_CHARS: frozenset[str] = frozenset({"r", "R"})
@@ -87,13 +69,19 @@ _CHAIN_OPERATORS: tuple[str, ...] = ("&&", "||", ";", "|")
 # ---------------------------------------------------------------------------
 
 
-def parse_command(raw: str, cwd: Path | None = None) -> ParsedCommand:
+def parse_command(
+    raw: str, cwd: Path | None = None, shell: str = "auto"
+) -> ParsedCommand:
     """Parse a raw shell command string into structured intent.
 
     Args:
         raw: The shell command string to parse.
         cwd: Working directory for resolving relative paths.
              Defaults to the current working directory.
+        shell: ``"posix"`` (bash/sh), ``"powershell"`` (PowerShell/pwsh/cmd),
+            or ``"auto"`` (default → POSIX). PowerShell mode preserves
+            backslashes in Windows paths and de-aliases cmdlets
+            (``Remove-Item`` → ``rm`` etc.).
 
     Returns:
         A ``ParsedCommand`` dict describing the command's structure and intent.
@@ -109,6 +97,8 @@ def parse_command(raw: str, cwd: Path | None = None) -> ParsedCommand:
             "recursive": True,
             "reversible": False,
         }
+        >>> parse_command("Remove-Item -Recurse build", shell="powershell")["command"]
+        'rm'
     """
     if cwd is None:
         cwd = Path.cwd()
@@ -117,16 +107,18 @@ def parse_command(raw: str, cwd: Path | None = None) -> ParsedCommand:
     if not raw:
         return _empty_result()
 
+    posix = shell not in ("powershell", "pwsh", "cmd")
+
     # Detect subshell / command substitution — we can't statically resolve these
     has_subshell = bool(_SUBSHELL_PATTERN.search(raw))
 
     # Tokenize
-    tokens = _tokenize(raw)
+    tokens = _tokenize(raw, posix=posix)
     if not tokens:
         return _empty_result()
 
     # Extract redirect targets before main parsing
-    tokens, redirect_targets = _extract_redirects(tokens)
+    tokens, redirect_targets, clobber = _extract_redirects(tokens)
     if not tokens:
         return _empty_result()
 
@@ -145,7 +137,9 @@ def parse_command(raw: str, cwd: Path | None = None) -> ParsedCommand:
         if idx >= len(tokens):
             return _empty_result()
 
-    base_command = tokens[idx]
+    # Canonicalize PowerShell/cmd verbs (Remove-Item → rm) so the rest of the
+    # pipeline is shell-agnostic.
+    base_command = canonicalize(tokens[idx])
     remaining = tokens[idx + 1 :]
 
     # Separate flags from positional arguments
@@ -157,6 +151,7 @@ def parse_command(raw: str, cwd: Path | None = None) -> ParsedCommand:
         if hit_double_dash:
             positional.append(token)
         elif token == "--":
+            positional.append(token)  # keep as a marker for `git checkout -- path`
             hit_double_dash = True
         elif token.startswith("-"):
             flags.append(token)
@@ -166,8 +161,11 @@ def parse_command(raw: str, cwd: Path | None = None) -> ParsedCommand:
     # Resolve positional args + redirect targets as paths
     targets = _resolve_targets(positional + redirect_targets, cwd)
 
-    # Classify intent
-    intent = _classify_intent(base_command, has_subshell)
+    # Classify intent / effect (flag- and operand-sensitive)
+    effect = classify_effect(
+        base_command, flags, positional, has_subshell=has_subshell, clobber=clobber
+    )
+    intent = effect.intent
 
     # Check for recursive flags
     recursive = _check_recursive(flags)
@@ -294,7 +292,9 @@ def split_command_chain(raw: str) -> list[str]:
     return parts
 
 
-def parse_command_chain(raw: str, cwd: Path | None = None) -> list[ParsedCommand]:
+def parse_command_chain(
+    raw: str, cwd: Path | None = None, shell: str = "auto"
+) -> list[ParsedCommand]:
     """Parse a chained shell command into a list of ParsedCommand entries.
 
     Splits the input on shell chain operators and parses each segment.
@@ -328,7 +328,7 @@ def parse_command_chain(raw: str, cwd: Path | None = None) -> list[ParsedCommand
     current_cwd = cwd
 
     for segment in segments:
-        parsed = parse_command(segment, cwd=current_cwd)
+        parsed = parse_command(segment, cwd=current_cwd, shell=shell)
         parsed_list.append(parsed)
 
         # Track cd to update cwd for following segments
@@ -357,8 +357,12 @@ def _empty_result() -> ParsedCommand:
     )
 
 
-def _tokenize(raw: str) -> list[str]:
+def _tokenize(raw: str, posix: bool = True) -> list[str]:
     """Tokenize a shell command string using shlex, with fallback.
+
+    With ``posix=False`` (PowerShell/cmd) backslashes are preserved so Windows
+    paths like ``.\\build`` survive tokenization; surrounding quotes are then
+    stripped manually.
 
     Example::
 
@@ -366,24 +370,34 @@ def _tokenize(raw: str) -> list[str]:
         ["rm", "-rf", "./config"]
     """
     try:
-        return shlex.split(raw)
+        toks = shlex.split(raw, posix=posix)
     except ValueError:
         logger.debug("shlex.split failed for %r, falling back to whitespace split", raw)
         return raw.split()
+    if not posix:
+        # Non-POSIX shlex keeps surrounding quotes inside tokens; strip them.
+        toks = [
+            t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in ("'", '"') else t
+            for t in toks
+        ]
+    return toks
 
 
-def _extract_redirects(tokens: list[str]) -> tuple[list[str], list[str]]:
+def _extract_redirects(tokens: list[str]) -> tuple[list[str], list[str], bool]:
     """Extract redirect targets from token list.
 
-    Returns the cleaned token list and a list of redirect target paths.
+    Returns the cleaned token list, a list of redirect target paths, and a
+    ``clobber`` flag that is True when a truncating ``>`` redirect (not ``>>``)
+    targets a file.
 
     Example::
 
         >>> _extract_redirects(["echo", "hello", ">", "output.txt"])
-        (["echo", "hello"], ["output.txt"])
+        (["echo", "hello"], ["output.txt"], True)
     """
     cleaned: list[str] = []
     redirect_targets: list[str] = []
+    clobber = False
     skip_next = False
 
     for i, token in enumerate(tokens):
@@ -396,6 +410,8 @@ def _extract_redirects(tokens: list[str]) -> tuple[list[str], list[str]]:
             if i + 1 < len(tokens):
                 redirect_targets.append(tokens[i + 1])
                 skip_next = True
+                if token in (">", "2>"):
+                    clobber = True
             continue
 
         # Redirect attached to target: >file or >>file
@@ -404,11 +420,13 @@ def _extract_redirects(tokens: list[str]) -> tuple[list[str], list[str]]:
             assert m is not None
             target = token[m.end() :]
             redirect_targets.append(target)
+            if m.group(2) == ">":
+                clobber = True
             continue
 
         cleaned.append(token)
 
-    return cleaned, redirect_targets
+    return cleaned, redirect_targets, clobber
 
 
 def _resolve_targets(positional: list[str], cwd: Path) -> list[str]:
@@ -460,7 +478,10 @@ def _looks_like_path(arg: str) -> bool:
 
 
 def _classify_intent(command: str, has_subshell: bool) -> str:
-    """Classify the intent of a command.
+    """Classify the bare intent of a command (no flags/operands).
+
+    Thin wrapper over :func:`blast_scope.command_effects.classify_effect`,
+    kept for callers that only have the command name.
 
     Example::
 
@@ -469,19 +490,7 @@ def _classify_intent(command: str, has_subshell: bool) -> str:
         >>> _classify_intent("cat", False)
         "read"
     """
-    if has_subshell:
-        return "unknown"
-
-    if command in DESTRUCTIVE_COMMANDS:
-        return "destructive"
-    if command in ADDITIVE_COMMANDS:
-        return "additive"
-    if command in READ_COMMANDS:
-        return "read"
-    if command in MIXED_COMMANDS:
-        return MIXED_COMMANDS[command]
-
-    return "unknown"
+    return classify_effect(canonicalize(command), [], [], has_subshell=has_subshell).intent
 
 
 def _check_recursive(flags: list[str]) -> bool:

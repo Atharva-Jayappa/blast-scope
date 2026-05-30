@@ -12,6 +12,7 @@ import pytest
 
 from blast_scope.command_parser import parse_command
 from blast_scope.graph_resolver import GraphResolver
+from blast_scope.recoverability import classify_path
 from blast_scope.risk_scorer import score_risk
 
 SAMPLE_PROJECT = Path(__file__).parent / "fixtures" / "sample_project"
@@ -30,15 +31,17 @@ class TestFullPipeline:
     def test_rm_rf_config_scores_above_baseline(self, resolver: GraphResolver) -> None:
         """rm -rf ./config.py on a file imported by 2 other files → medium+.
 
-        In our small fixture (2 importers), score = 0.9 * 0.2 * 2.0 = 0.36.
-        With a real project (8+ importers) this would be critical. The key
-        assertion: config scores significantly higher than a file with no importers.
+        config.py is git-tracked (recoverable from history), so the two-axis
+        model treats it as medium rather than critical — but its 2 importers
+        keep it well above a file nothing depends on. With a real project
+        (8+ importers) this would escalate to high/critical.
         """
         parsed = parse_command("rm -rf ./config.py", cwd=SAMPLE_PROJECT)
         resolutions = resolver.resolve_paths(
             [Path(t) for t in parsed["targets"]]
         )
-        result = score_risk(parsed, resolutions)
+        recoverability = classify_path(Path(parsed["targets"][0]))
+        result = score_risk(parsed, resolutions, recoverability)
 
         assert result["severity"] in ("medium", "high", "critical")
         assert result["recommendation"] in ("confirm", "block")
