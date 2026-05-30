@@ -1,35 +1,93 @@
 # Blast Scope
 
-MCP tool that scores the blast radius of shell commands before execution. It parses commands, resolves target paths against a Tree-sitter-powered dependency graph, and returns a structured risk assessment — not a blocklist, but a contextual risk score.
+**A consequence engine for shell commands.** Blast Scope scores what a command
+would actually *do* — before an AI agent (or you) runs it. It doesn't pattern-match
+on syntax; it resolves targets against a dependency graph, the git working tree,
+secret/data classification, and infrastructure context, then returns a structured
+risk score with evidence.
 
-Same command, completely different score based on structural consequence:
+The whole point is contextual blast radius. The *same command* gets a completely
+different score depending on what it would hit:
 
-> `rm -rf ./logs` — **LOW** risk. No graph dependencies, no importers. **Proceed.**
+```
+rm -rf ./logs        →  LOW       0 importers, regenerable, outside src tree.        proceed
+rm -rf ./config      →  CRITICAL  8 modules import it, high PageRank centrality.     block
+rm .env              →  CRITICAL  secret, unrecoverable — even with 0 importers.     block
+git reset --hard     →  LOW       working tree is clean — nothing to discard.        proceed
+git reset --hard     →  HIGH      would discard 4 files with uncommitted changes.    confirm
+```
 
-> `rm -rf ./config` — **CRITICAL**. Multiple nodes import from this path, high in-degree. **Block.**
+> Not a blocklist. Not a replacement for Shellfirm. Not a syscall monitor. It
+> scores *structural consequence* — and for risky commands it captures an undo
+> snapshot first.
+
+---
+
+## How it works
+
+```
+shell command
+     │
+     ▼
+┌─────────────┐   split chains (&& || ; |), de-alias PowerShell cmdlets,
+│   parse     │   classify intent + flags (rm -rf ≠ rm, > ≠ >>)
+└─────┬───────┘
+      │ targets, flags, intent
+      ▼
+┌──────────────────────────── score (two axes) ────────────────────────────┐
+│                                                                           │
+│   blast radius                              recoverability                │
+│   ────────────                              ──────────────                │
+│   command_weight                            git tracked / dirty           │
+│   × structural   ←── dependency graph       regenerable (node_modules)    │
+│      (in-degree, PageRank centrality)       secret (.env/.pem/id_rsa)     │
+│                                             precious (*.tfstate/*.db)     │
+│                                                                           │
+│              ÷  reversibility_factor  ──────────────┘                     │
+│                                                                           │
+│   + out-of-graph consequences (floors):                                   │
+│       VCS   — git reset/clean/push --force, scaled by working-tree state  │
+│       infra — Dockerfile, Terraform, k8s, CI configs                      │
+│       config— files loaded by path string the import graph can't see      │
+└─────────────────────────────────┬─────────────────────────────────────────┘
+                                   ▼
+        score 0.0–1.0 → severity (low/medium/high/critical) → recommendation
+                                   │
+                                   ▼
+              PreToolUse hook: advise + snapshot risky targets (undoable)
+```
+
+See [docs/heuristics.md](docs/heuristics.md) for the exact formula, weight tables,
+and calibration.
+
+---
 
 ## Status
 
-**v0.1.0 — early development.** Core pipeline works end-to-end: parse → resolve → score. Not yet published to PyPI.
+**v0.1.0 — working end-to-end, not yet on PyPI.** Built in four phases:
 
-What's implemented:
-- `shlex`-based command parser with intent classification (destructive / additive / read / unknown)
-- `sudo` stripping, redirect extraction, subshell detection, recursive flag parsing
-- Chained command splitting on `&&`, `||`, `;`, `|` — each segment scored independently, with `cd` tracked across the chain
-- Git-based reversibility checks (`git ls-files`)
-- Tree-sitter dependency graph (vendored from [code-review-graph](https://github.com/tirth8205/code-review-graph))
-- In-degree-based risk scoring with configurable command weights
-- Auto-indexing on first `assess_command` call when a `project_root` is provided
-- MCP server (stdio) exposing two tools: `assess_command` and `index_project`
+| Capability | Module |
+|---|---|
+| Flag/operand-sensitive command model (POSIX **and** PowerShell) | `command_effects.py`, `command_parser.py` |
+| Recoverability classification (git state, secrets, regenerable, precious data) | `recoverability.py` |
+| Dependency graph + weighted **PageRank** centrality, incremental indexing | `graph_resolver.py`, `centrality.py` |
+| Two-axis, evidence-based scoring | `risk_scorer.py` |
+| Out-of-graph **consequence analyzers** (VCS / infra / config-by-path) | `consequences.py`, `vcs.py`, `infra.py`, `config_refs.py` |
+| **PreToolUse hook** + tarball **snapshot/undo** | `hook.py`, `snapshot.py` |
+| **Eval harness** + labeled corpus + calibration | `eval.py`, `tests/fixtures/eval_corpus.jsonl` |
 
-What's not yet implemented:
-- Runtime-load detection
-- Backup/snapshot detection
-- Per-file staleness in the cached graph (use `index_project` to force a full rebuild)
+**Calibration (2026-05-30):** on a 28-case labeled corpus spanning every
+recoverability category, git state, infra/config files, and a graph-indexed
+case — **28/28 exact severity, gate F1 1.00.** `tests/test_eval.py` pins these
+with headroom so future changes can't silently regress. Run it yourself:
+
+```bash
+uv run python -m blast_scope.eval
+```
+
+---
 
 ## Installation
-
-Not yet on PyPI. Install from source:
 
 ```bash
 git clone https://github.com/Atharva-Jayappa/blast-scope.git
@@ -37,89 +95,120 @@ cd blast-scope
 uv sync --all-extras
 ```
 
-Or install directly from GitHub:
+Or directly:
 
 ```bash
 uv pip install git+https://github.com/Atharva-Jayappa/blast-scope.git
 ```
 
-## MCP Configuration
+---
+
+## Usage
+
+### As an MCP server
 
 Add to your MCP client config (e.g. Claude Code `settings.json`):
 
 ```json
 {
   "mcpServers": {
-    "blast-scope": {
-      "command": "blast-scope",
-      "type": "stdio"
-    }
+    "blast-scope": { "command": "blast-scope", "type": "stdio" }
   }
 }
 ```
 
-If installed from source with `uv`, use the full path or run via `uv run blast-scope`.
+Tools exposed:
 
-## Tools
+| Tool | Purpose |
+|---|---|
+| `assess_command(command, cwd?, project_root?)` | Score a (possibly chained) command. Returns score, severity, rationale, evidence, recoverability, affected nodes, and a per-segment `chain` breakdown. |
+| `index_project(project_root)` | Force a dependency-graph rebuild (auto-built on first use otherwise). |
+| `list_snapshots(project_root)` | List undo snapshots, newest first. |
+| `restore_snapshot(snapshot_id, project_root)` | Undo a risky command by restoring its snapshot. |
 
-### `assess_command`
+### As a PreToolUse hook (advise + auto-snapshot)
 
-Assess the blast radius of a shell command.
+Intercept Bash commands *before* they run — advisory, never blocking, and it
+snapshots destructive targets so any mistake is reversible (even files git
+can't recover). Add to `.claude/settings.json`:
 
-**Parameters:**
-- `command` (required): Raw shell command string to analyze (chained commands using `&&`, `||`, `;`, `|` are split and scored per-segment)
-- `cwd` (optional): Working directory for resolving relative paths. `cd` segments inside a chain update the cwd for following segments.
-- `project_root` (optional): Project root for graph-based dependency scoring. The graph is auto-built on first call.
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "python -m blast_scope.hook" }] }
+    ]
+  }
+}
+```
 
-**Returns:** Risk assessment with overall score (0.0–1.0), severity, rationale, affected nodes, recommendation, and a `chain` array containing the per-segment breakdown. The top-level fields reflect the worst single step — a chain is only as safe as its riskiest link.
+Full details and the undo flow: [docs/hook.md](docs/hook.md).
 
-### `index_project`
+---
 
-Force a rebuild of the dependency graph for a project. Normally not needed — `assess_command` auto-builds the graph the first time it sees a `project_root`. Call this when the codebase has changed substantially. The graph is stored in `.blast-scope/graph.db` under the project root.
+## Example output
 
-**Parameters:**
-- `project_root` (required): Absolute path to the project root
+```jsonc
+// assess_command("rm -rf ./config", project_root="/proj")
+{
+  "score": 0.93,
+  "severity": "critical",
+  "recommendation": "block",
+  "recoverability": "untracked",
+  "rationale": "rm targets config. 8 direct importer(s), 14 total affected. not git-tracked. recursive deletion. CRITICAL risk.",
+  "evidence": [
+    "8 importer(s), 14 affected node(s)",
+    "high centrality (PageRank 0.91) — a hub other code routes through",
+    "untracked — not in git history",
+    "recursive — applies to every file underneath"
+  ],
+  "affected_nodes": [ /* ... */ ],
+  "chain": [ /* per-segment breakdown */ ]
+}
+```
 
-## How It Works
-
-1. **Split** — Chained commands (`cmd1 && cmd2`, `cmd1 ; cmd2`, etc.) are split into individual segments while respecting quotes and command substitution. `cd` segments update the working directory used to resolve following segments.
-2. **Parse** — Each segment is tokenized with `shlex` to extract the command, flags, target paths, and intent (destructive / additive / read / unknown).
-3. **Resolve** — Target paths are mapped to nodes in a Tree-sitter-powered dependency graph stored in SQLite. In-degree (how many other files reference a target) is the key signal.
-4. **Score** — `command_weight × normalized_in_degree × (1 / reversibility_factor)` produces a 0.0–1.0 risk score per segment, mapped to severity (low / medium / high / critical) and a recommendation (proceed / confirm / block). For chains, the worst segment's score is surfaced at the top level.
-
-See [docs/heuristics.md](docs/heuristics.md) for the full scoring formula, weight tables, and worked examples.
+---
 
 ## Development
 
 ```bash
 uv sync --all-extras
-
-uv run pytest -v
-
-uv run blast-scope
+uv run pytest -q              # full suite
+uv run python -m blast_scope.eval   # scoring accuracy report
 ```
 
-## Project Structure
+### Project structure
 
 ```
 blast-scope/
 ├── src/blast_scope/
-│   ├── server.py            # MCP server, two tools
-│   ├── command_parser.py    # shell command → structured intent
-│   ├── graph_resolver.py    # paths → dependency graph nodes
-│   ├── risk_scorer.py       # signals → risk score + rationale
+│   ├── server.py            # MCP server + tools (assess, index, snapshots)
+│   ├── command_parser.py    # shell → structured intent (POSIX + PowerShell)
+│   ├── command_effects.py   # command/flag/operand → intent + weight
+│   ├── recoverability.py    # path → how recoverable if destroyed
+│   ├── graph_resolver.py    # paths → dependency-graph impact (+ PageRank)
+│   ├── centrality.py        # pure-Python weighted PageRank
+│   ├── risk_scorer.py       # signals → score + severity + evidence
+│   ├── consequences.py      # coordinator for out-of-graph analyzers
+│   ├── vcs.py / infra.py / config_refs.py   # consequence analyzers
+│   ├── hook.py              # PreToolUse advisory hook
+│   ├── snapshot.py          # tarball snapshot / restore / list
+│   ├── eval.py              # evaluation harness + metrics
 │   └── vendor/crg/          # vendored from code-review-graph (MIT)
-├── tests/
-│   ├── fixtures/            # test command strings + sample project
-│   ├── test_command_parser.py
-│   ├── test_graph_resolver.py
-│   ├── test_risk_scorer.py
-│   ├── test_chain.py
-│   └── test_e2e.py
+├── tests/                   # 230+ tests incl. eval regression guard
+│   └── fixtures/eval_corpus.jsonl   # labeled calibration corpus
 └── docs/
-    └── heuristics.md
+    ├── heuristics.md        # scoring model + calibration
+    └── hook.md              # hook registration + undo
 ```
 
-## License
+---
 
-See [CLAUDE.md](CLAUDE.md) for the full project spec, contracts, and build order.
+## Roadmap
+
+- Calibrate against a larger, real-world corpus (current corpus is 28 cases).
+- PowerShell-shell awareness in the hook path (the MCP tool already supports it).
+- Optional richer interception modes beyond advisory.
+
+See [CLAUDE.md](CLAUDE.md) for the full spec, contracts, and design rules.

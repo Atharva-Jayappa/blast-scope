@@ -154,6 +154,24 @@ def _graph_exists(project_root: Path) -> bool:
     return (project_root / ".blast-scope" / "graph.db").exists()
 
 
+def reset_resolvers() -> None:
+    """Close and drop all cached graph resolvers, releasing SQLite handles.
+
+    The server caches one open ``GraphResolver`` (and its SQLite connection)
+    per project root. Long-lived servers want that; short-lived callers that
+    score many throwaway projects — notably the evaluation harness on Windows,
+    where an open handle blocks temp-dir deletion — must release them. Safe to
+    call anytime; the next ``assess`` rebuilds what it needs.
+    """
+    for resolver in _resolvers.values():
+        try:
+            resolver.close()
+        except Exception:  # best-effort cleanup
+            logger.debug("failed to close resolver", exc_info=True)
+    _resolvers.clear()
+    _indexed_roots.clear()
+
+
 def _worst_recoverability(targets: list[str]) -> Recoverability | None:
     """Classify each target and return the least-recoverable one.
 

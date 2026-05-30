@@ -1,0 +1,28 @@
+{"id": "ls_read", "command": "ls -la", "expected": "low", "note": "read-only listing"}
+{"id": "cat_read", "command": "cat README.md", "setup": {"files": {"README.md": "# hi\n"}}, "expected": "low", "note": "read-only"}
+{"id": "git_status", "command": "git status", "setup": {"git": {"committed": {"a.py": "x = 1\n"}}}, "expected": "low", "note": "inspection only"}
+{"id": "mkdir_new", "command": "mkdir newdir", "expected": "low", "note": "additive"}
+{"id": "touch_new", "command": "touch newfile.py", "expected": "low", "note": "additive"}
+{"id": "echo_append", "command": "echo line >> log.txt", "setup": {"files": {"log.txt": "old\n"}}, "expected": "low", "note": "append, not clobber"}
+{"id": "rm_node_modules", "command": "rm -rf node_modules", "setup": {"dirs": ["node_modules"], "files": {"node_modules/x.js": "//\n"}}, "expected": "low", "note": "regenerable artifact"}
+{"id": "rm_pycache", "command": "rm -rf __pycache__", "setup": {"dirs": ["__pycache__"], "files": {"__pycache__/m.pyc": "x"}}, "expected": "low", "note": "regenerable"}
+{"id": "rm_dist", "command": "rm -rf dist", "setup": {"dirs": ["dist"], "files": {"dist/bundle.js": "x"}}, "expected": "low", "note": "regenerable build output"}
+{"id": "rm_absent", "command": "rm ghost.txt", "expected": "low", "note": "nothing to lose"}
+{"id": "git_reset_hard_clean", "command": "git reset --hard", "setup": {"git": {"committed": {"a.py": "x = 1\n"}}}, "expected": "low", "note": "clean tree, nothing to discard"}
+{"id": "git_clean_clean", "command": "git clean -fd", "setup": {"git": {"committed": {"a.py": "x = 1\n"}}}, "expected": "low", "note": "no untracked files"}
+{"id": "rm_untracked_src", "command": "rm util.py", "setup": {"files": {"util.py": "def f():\n    pass\n"}}, "expected": "medium", "note": "untracked source, not in history"}
+{"id": "echo_clobber", "command": "echo x > notes.txt", "setup": {"files": {"notes.txt": "important\n"}}, "expected": "medium", "note": "truncating redirect over existing file"}
+{"id": "git_checkout_one", "command": "git checkout -- a.py", "setup": {"git": {"committed": {"a.py": "x = 1\n"}, "modified": {"a.py": "x = 2\n"}}}, "expected": "medium", "note": "discards 1 modified file"}
+{"id": "rm_tfstate", "command": "rm terraform.tfstate", "setup": {"files": {"terraform.tfstate": "{}\n"}}, "expected": "high", "note": "precious irreplaceable state"}
+{"id": "rm_prod_db", "command": "rm prod.db", "setup": {"files": {"prod.db": "rows\n"}}, "expected": "high", "note": "precious data file"}
+{"id": "rm_dockerfile", "command": "rm Dockerfile", "setup": {"files": {"Dockerfile": "FROM scratch\n"}}, "expected": "high", "note": "infra descriptor"}
+{"id": "rm_terraform", "command": "rm main.tf", "setup": {"files": {"main.tf": "resource x {}\n"}}, "expected": "high", "note": "infra-as-code"}
+{"id": "rm_workflow", "command": "rm .github/workflows/ci.yml", "setup": {"files": {".github/workflows/ci.yml": "on: push\n"}}, "expected": "high", "note": "CI pipeline file"}
+{"id": "rm_config_referenced", "command": "rm config.yaml", "setup": {"files": {"config.yaml": "k: v\n", "app.py": "open('config.yaml')\n", "loader.py": "CFG = 'config.yaml'\n"}}, "expected": "high", "note": "config loaded by path in 2 places"}
+{"id": "git_reset_hard_dirty", "command": "git reset --hard", "setup": {"git": {"committed": {"a.py": "1\n", "b.py": "1\n", "c.py": "1\n", "d.py": "1\n"}, "modified": {"a.py": "2\n", "b.py": "2\n", "c.py": "2\n", "d.py": "2\n"}}}, "expected": "high", "note": "discards 4 modified files"}
+{"id": "git_clean_force_dirty", "command": "git clean -fd", "setup": {"git": {"committed": {"a.py": "1\n"}, "untracked": {"x.py": "1\n", "y.py": "1\n", "z.py": "1\n"}}}, "expected": "high", "note": "deletes 3 untracked files"}
+{"id": "git_push_force", "command": "git push --force", "setup": {"git": {"committed": {"a.py": "1\n"}}}, "expected": "high", "note": "rewrites remote history"}
+{"id": "rm_env_secret", "command": "rm .env", "setup": {"files": {".env": "API_KEY=xyz\n"}}, "expected": "critical", "note": "secret, unrecoverable"}
+{"id": "rm_pem_secret", "command": "rm server.pem", "setup": {"files": {"server.pem": "-----BEGIN-----\n"}}, "expected": "critical", "note": "private key"}
+{"id": "rm_id_rsa", "command": "rm id_rsa", "setup": {"files": {"id_rsa": "key\n"}}, "expected": "critical", "note": "ssh private key"}
+{"id": "rm_config_py_graph", "command": "rm config.py", "index": true, "setup": {"files": {"main.py": "import config\nimport db\n", "db.py": "import config\n", "config.py": "VALUE = 1\n"}}, "expected": "critical", "note": "central module, 2 importers via graph"}
