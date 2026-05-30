@@ -1,95 +1,119 @@
-# Scoring Heuristics
+# Scoring heuristics
 
-Documentation for blast-scope's risk scoring logic. This file evolves as real data comes in.
+How blast-scope turns a shell command into a 0.0–1.0 risk score. Documented as
+it evolves; every constant here is calibrated against
+`tests/fixtures/eval_corpus.jsonl` (see [calibration](#calibration)).
 
-## Formula (v1)
+## The two-axis model
+
+Risk is **blast radius** divided by **recoverability** — orthogonal questions:
 
 ```
-score = command_weight × normalized_in_degree × (1 / reversibility_factor)
+                 ┌─────────────── blast radius ───────────────┐
+   score  =  command_weight  ×  structural  ×  (1 / reversibility_factor)
+                                   │                    │
+              how much depends on it (graph)     can it be undone?
 ```
 
-Final score is clamped to [0.0, 1.0].
+- **command_weight** — from `command_effects.py`. Flag/operand-sensitive:
+  `rm -rf` ≠ `rm`, `git reset --hard` ≠ `git status`, redirect-clobber `>` ≠
+  append `>>`. Reads weigh ~0.
+- **structural** — `max(normalized_in_degree, pagerank_importance)`. A file is
+  high blast radius if *either* many things import it directly *or* it is
+  globally central (weighted PageRank over the dependency graph). OR-semantics,
+  not a tuned weighted sum.
+- **reversibility_factor** — `max(0.25, 2.0 − 1.75 × irrecoverability)`. Fully
+  recoverable (git-clean) ⇒ 2.0 (halves risk); gone-for-good ⇒ 0.25 (≈×4).
+  `× 0.5` again if the command is recursive.
 
-## Command Weights
+## Recoverability categories
 
-| Command    | Weight | Category    |
-|------------|--------|-------------|
-| `rm`       | 0.9    | Destructive |
-| `rmdir`    | 0.7    | Destructive |
-| `truncate` | 0.8    | Destructive |
-| `dd`       | 1.0    | Destructive |
-| `mkfs`     | 1.0    | Destructive |
-| `shred`    | 1.0    | Destructive |
-| `mv`       | 0.6    | Modifying   |
-| `chmod`    | 0.5    | Modifying   |
-| `chown`    | 0.5    | Modifying   |
-| `sed`      | 0.4    | Modifying   |
-| `touch`    | 0.1    | Additive    |
-| `mkdir`    | 0.1    | Additive    |
-| `cp`       | 0.2    | Additive    |
-| `cat`      | 0.0    | Read        |
-| `ls`       | 0.0    | Read        |
-| `grep`     | 0.0    | Read        |
-| Unknown    | 0.3    | Default     |
+From `recoverability.py` (`classify_path`). After the raw score, a category
+**floor or cap** is applied — the multiplicative axis alone can't say
+"irreplaceable regardless of importers" or "always cheap to rebuild":
 
-Read commands always score 0.0 regardless of graph data.
+| category        | irrecoverability | effect on score | rationale |
+|-----------------|------------------|-----------------|-----------|
+| `absent`        | 0.0              | cap ≤ 0.10      | nothing to lose |
+| `regenerable`   | 0.05             | cap ≤ 0.15      | node_modules/dist/__pycache__ rebuild |
+| `tracked_clean` | 0.2              | —               | recoverable from git |
+| `tracked_dirty` | 0.55             | —               | uncommitted changes would be lost |
+| `untracked`     | 0.7              | floor ≥ 0.20    | not in history ⇒ unrecoverable |
+| `precious_data` | 0.85             | floor ≥ 0.60    | *.tfstate / *.db / *.dump |
+| `gitignored`    | 0.85             | floor ≥ 0.60    | not in history |
+| `secret`        | 0.9              | floor ≥ 0.85    | .env / *.pem / id_rsa — sensitive + unrecoverable |
 
-## Normalized In-Degree
+Caps/floors apply only to state-changing commands (not pure reads).
 
-`normalized_in_degree = min(total_in_degree / 10, 1.0)`
+## Out-of-graph consequences
 
-- A file with 10+ direct importers from other files = maximum risk (1.0).
-- A file with 0 importers but present in the graph gets a baseline of 0.1.
-- A file not in the graph at all gets a baseline of 0.1 (no graph data available).
+The import graph is blind to whole classes of blast radius. `consequences.py`
+gathers these; the strongest floor per domain is applied. **Where** in the
+pipeline matters:
 
-## Reversibility Factor
+- **path-tied** (`infra`, `config`) — floor applied **before** the
+  recoverability caps, so a regenerable/absent target still caps low
+  (`rm node_modules` stays safe even if code references it).
+- **VCS** (`vcs`) — applied **after** the caps and **ungated**, because the
+  danger is in the working-tree/history state, *not* the operand. git's
+  "targets" are subcommands/refs, not files — so the target's recoverability
+  (e.g. the bogus `absent` from treating `reset` as a path) must not suppress a
+  real working-tree consequence. `vcs.analyze_git` only fires for genuinely
+  destructive ops, so it is self-gating.
 
-| Condition                        | Factor |
-|----------------------------------|--------|
-| Git-tracked, not recursive       | 2.0    |
-| Git-tracked, recursive           | 1.0    |
-| Not tracked, not recursive       | 1.0    |
-| Not tracked, recursive           | 0.5    |
+Domain floors:
 
-Higher factor = lower risk (tracked files are recoverable from git history).
-Recursive operations halve the factor (more dangerous, harder to undo).
+- **VCS** — *context-aware*. `git reset --hard` on a clean tree is 0.0; floor
+  scales with the working-tree state it would destroy
+  (`min(0.9, 0.4 + 0.05 × n)` for n modified/untracked files). `push --force`
+  0.7, `rebase`/`filter-branch` 0.6, `branch -D` 0.4.
+- **infra** — Dockerfile, compose, `*.tf`/`*.tfvars`, k8s/helm, CI workflows ⇒
+  floor 0.6. Real deploy-time impact, zero AST in-degree.
+- **config/data** — files loaded by *path string* (`open("config.yaml")`) that
+  no import edge points at. Bounded source scan; floor
+  `min(0.85, 0.45 + 0.05 × references)`.
 
-## Severity Thresholds
+## Severity & recommendation
 
-| Score Range | Severity | Recommendation |
-|-------------|----------|----------------|
-| 0.0 – 0.2  | low      | proceed        |
-| 0.2 – 0.5  | medium   | confirm        |
-| 0.5 – 0.8  | high     | confirm        |
-| 0.8 – 1.0  | critical | block          |
+| score      | severity  | recommendation |
+|------------|-----------|----------------|
+| ≥ 0.80     | critical  | block          |
+| ≥ 0.50     | high      | confirm        |
+| ≥ 0.20     | medium    | confirm        |
+| < 0.20     | low       | proceed        |
 
-## Worked Examples
+("block"/"confirm" are advice — the hook never hard-blocks.)
 
-### `rm -rf ./logs` (untracked, no importers)
-- command_weight = 0.9
-- normalized_in_degree = 0.1 (baseline, not in graph)
-- reversibility_factor = 0.5 (not tracked + recursive)
-- score = 0.9 × 0.1 × (1/0.5) = 0.18 → **LOW**, proceed
+## Calibration
 
-### `rm -rf ./config` (8 importers, not tracked)
-- command_weight = 0.9
-- normalized_in_degree = 0.8 (8/10)
-- reversibility_factor = 0.5 (not tracked + recursive)
-- score = 0.9 × 0.8 × 2.0 = 1.44 → clamped to 1.0 → **CRITICAL**, block
+`eval.py` runs the labeled corpus (`tests/fixtures/eval_corpus.jsonl`, 28 cases:
+12 low / 3 medium / 9 high / 4 critical, spanning every recoverability category,
+git clean-vs-dirty state, infra/config files, and a graph-indexed central
+module). Each case is materialized in a throwaway project — including git
+working-tree state and, when needed, a built dependency graph — then scored with
+the real `assess()`. It reports:
 
-### `cat main.py`
-- command_weight = 0.0
-- score = 0.0 → **LOW**, proceed
+- **exact severity** and **within-one-band** accuracy
+- **gate** precision/recall/F1 (proceed vs. flag, truth = not-low)
+- a confusion matrix and a list of mismatches
 
-### `mv a.py b.py` (2 importers, git-tracked)
-- command_weight = 0.6
-- normalized_in_degree = 0.2
-- reversibility_factor = 2.0 (tracked, not recursive)
-- score = 0.6 × 0.2 × 0.5 = 0.06 → **LOW**, proceed
+Run it: `python -m blast_scope.eval`.
 
-## Known Limitations
+**Current calibration (2026-05-30):** 28/28 exact, 28/28 within-one-band, gate
+F1 1.00. `tests/test_eval.py` pins these with headroom (exact ≥ 0.85, within ≥
+0.95, F1 ≥ 0.9, and no critical-labeled command ever scored `proceed`) so future
+tuning can't silently regress.
 
-- **Chained commands** (`&&`, `||`, `;`): only the first command is analyzed.
-- **Subshell expansion** (`$(...)`, backticks): intent set to "unknown" since targets can't be statically resolved.
-- **Cross-language imports**: dependency graph accuracy depends on Tree-sitter grammar support.
-- **Graph staleness**: graph must be explicitly rebuilt via `index_project` — no automatic invalidation yet.
+Three calibration fixes came out of the first runs, all in `risk_scorer.py`:
+
+1. Consequence floors were gated on `command_weight > 0`, which is 0 for
+   `git checkout`/`push` — so VCS consequences never applied. Re-gated path-tied
+   floors on `intent != "read"`.
+2. `untracked` files (unrecoverable) had no floor and scored `low`; added a 0.20
+   floor so losing an unrecoverable file is at least `medium`.
+3. The `absent` cap was crushing VCS floors to 0.10 (git's subcommand token gets
+   mis-classified as an absent path). Split consequence handling so VCS floors
+   apply *after* the caps and ungated; path-tied floors stay before the caps.
+
+When adding a heuristic, add corpus cases that exercise it and re-run the harness
+before trusting the number.

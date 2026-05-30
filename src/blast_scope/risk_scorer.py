@@ -189,12 +189,16 @@ def score_risk(
     raw_score = weight * structural * (1.0 / reversibility_factor)
     score = max(0.0, min(1.0, raw_score))
 
-    # Out-of-graph consequences (VCS history loss, infra/deploy reach, config
-    # files loaded by path) raise the score to their floor. Applied BEFORE the
-    # recoverability caps below so a regenerable/absent target — node_modules,
-    # a path that doesn't exist — still caps low even if something references it.
-    if consequences and weight > 0.0:
-        score = max(score, max_floor(consequences))
+    # Path-tied consequences (infra/deploy reach, config files loaded by path)
+    # raise the score to their floor. Applied BEFORE the recoverability caps
+    # below so a regenerable/absent target — node_modules, a path that doesn't
+    # exist — still caps low even if something references it. Gated on intent so
+    # a read (`cat config.yaml`) isn't raised.
+    if consequences and parsed["intent"] != "read":
+        path_floor = max(
+            (c.floor for c in consequences if c.domain != "vcs"), default=0.0
+        )
+        score = max(score, path_floor)
 
     # Category floors/caps — the reversibility axis on its own can't express
     # "irreplaceable regardless of importers" or "always cheap to rebuild".
@@ -209,6 +213,21 @@ def score_risk(
             score = max(score, 0.85)
         elif cat in ("precious_data", "gitignored"):
             score = max(score, 0.6)
+        elif cat == "untracked":
+            # Not in git history → unrecoverable once destroyed. Even an
+            # unknown file is at least a medium concern when it's gone for good.
+            score = max(score, 0.2)
+
+    # VCS consequences are orthogonal to the target *path* — the danger is in
+    # the working-tree/history state, not the operand (git's "targets" are
+    # subcommands/refs, not files). So apply them AFTER the recoverability caps,
+    # and ungated: vcs.analyze_git only fires for genuinely destructive ops
+    # (reset --hard, clean -f, push --force…), never for git status/log.
+    if consequences:
+        vcs_floor = max(
+            (c.floor for c in consequences if c.domain == "vcs"), default=0.0
+        )
+        score = max(score, vcs_floor)
 
     # Severity mapping
     severity = _score_to_severity(score)
@@ -224,7 +243,7 @@ def score_risk(
     # Build rationale + evidence
     rationale = _build_rationale(parsed, resolutions, score, severity, has_graph_data)
     evidence = _build_evidence(parsed, resolutions, recoverability, has_graph_data, importance)
-    if consequences and weight > 0.0:
+    if consequences and parsed["intent"] != "read":
         evidence.extend(c.evidence for c in consequences)
 
     return RiskAssessment(
