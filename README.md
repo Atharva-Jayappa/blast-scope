@@ -54,7 +54,8 @@ shell command
         score 0.0–1.0 → severity (low/medium/high/critical) → recommendation
                                    │
                                    ▼
-              PreToolUse hook: advise + snapshot risky targets (undoable)
+     PreToolUse hook: tiered by severity — silent (low/med) → advise (high)
+                 → advise + snapshot (critical, undoable)
 ```
 
 See [docs/heuristics.md](docs/heuristics.md) for the exact formula, weight tables,
@@ -126,11 +127,13 @@ Tools exposed:
 | `list_snapshots(project_root)` | List undo snapshots, newest first. |
 | `restore_snapshot(snapshot_id, project_root)` | Undo a risky command by restoring its snapshot. |
 
-### As a PreToolUse hook (advise + auto-snapshot)
+### As a PreToolUse hook (tiered advice + auto-snapshot)
 
-Intercept Bash commands *before* they run — advisory, never blocking, and it
-snapshots destructive targets so any mistake is reversible (even files git
-can't recover). Add to `.claude/settings.json`:
+Intercept Bash commands *before* they run — advisory, never blocking. Volume
+scales with stakes: **silent** on low/medium, **advise** on high, **advise +
+snapshot** on critical. The snapshot skips what's already recoverable
+(git-clean, regenerable) and warns rather than tars anything over a hard size
+cap, so the undo net stays fast and trustworthy. Add to `.claude/settings.json`:
 
 ```json
 {

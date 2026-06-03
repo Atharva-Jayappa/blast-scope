@@ -21,11 +21,27 @@ import uuid
 from pathlib import Path
 from typing import TypedDict
 
+from blast_scope.recoverability import classify_path
+
 logger = logging.getLogger(__name__)
 
 _SNAPSHOT_SUBDIR = Path(".blast-scope") / "snapshots"
 _ARCHIVE_NAME = "data.tar.gz"
 _MANIFEST_NAME = "manifest.json"
+
+# Recoverability categories a snapshot would only duplicate: git history or a
+# cheap rebuild already covers them. Driving the skip off ``classify_path``
+# keeps recoverability.py the single source of truth — we never re-derive
+# "is this safe to lose" with a second set of patterns here.
+_RECOVERABLE_CATEGORIES: frozenset[str] = frozenset(
+    {"tracked_clean", "regenerable", "absent"}
+)
+
+# Hard ceiling on what one snapshot will archive. Taring a multi-GB tree to
+# "protect" it stalls the agent and can fill the disk — strictly worse than the
+# risk of losing something that large and regenerable-by-nature. Oversize
+# targets are reported to the caller (which warns), never silently tarred.
+_MAX_SNAPSHOT_BYTES: int = 256 * 1024 * 1024  # 256 MiB
 
 
 class SnapshotEntry(TypedDict):
@@ -52,9 +68,78 @@ class Snapshot(TypedDict):
     entries: list[SnapshotEntry]
 
 
+class SnapshotPlan(TypedDict):
+    """The decision of *what* to snapshot, before any tarball is written.
+
+    Separates policy (which targets are worth and safe to archive) from the
+    mechanism in :func:`create_snapshot` (tar the given paths). Driven entirely
+    by :func:`blast_scope.recoverability.classify_path` and a size cap.
+
+    Example::
+
+        {"archive": ["/proj/.env"], "skipped_recoverable": ["/proj/node_modules"],
+         "skipped_oversize": ["/proj/data"]}
+    """
+
+    archive: list[str]              # existing, non-recoverable, within-cap → tar these
+    skipped_recoverable: list[str]  # git-clean / regenerable → no snapshot needed
+    skipped_oversize: list[str]     # over the size cap → warn, don't tar
+
+
 def snapshots_dir(root: Path | str) -> Path:
     """Return the snapshot storage directory for a project ``root``."""
     return Path(root) / _SNAPSHOT_SUBDIR
+
+
+def plan_snapshot(
+    targets: list[str | Path], *, max_bytes: int = _MAX_SNAPSHOT_BYTES
+) -> SnapshotPlan:
+    """Decide which targets to archive, using recoverability + a size cap.
+
+    A target is *not* archived when either:
+
+    - its recoverability category is one git or a rebuild already covers
+      (``tracked_clean``, ``regenerable``, ``absent``) — snapshotting it would
+      be redundant; or
+    - it is larger than ``max_bytes`` — taring it would stall the agent / fill
+      the disk, so it is reported as oversize for the caller to warn about.
+
+    Everything else is returned in ``archive`` for :func:`create_snapshot`.
+
+    Args:
+        targets: Absolute paths a destructive command is about to hit.
+        max_bytes: Hard cap on a single target's size; defaults to 256 MiB.
+
+    Returns:
+        A :class:`SnapshotPlan` partitioning the targets.
+
+    Example::
+
+        >>> plan_snapshot(["/proj/.env", "/proj/node_modules"])["archive"]
+        ['/proj/.env']
+    """
+    archive: list[str] = []
+    skipped_recoverable: list[str] = []
+    skipped_oversize: list[str] = []
+
+    for t in targets:
+        path = Path(t)
+        # Nothing on disk → nothing to lose (create_snapshot would skip it too).
+        if not (path.exists() or path.is_symlink()):
+            continue
+        if classify_path(path)["category"] in _RECOVERABLE_CATEGORIES:
+            skipped_recoverable.append(str(path))
+            continue
+        if _exceeds_cap(path, max_bytes):
+            skipped_oversize.append(str(path))
+            continue
+        archive.append(str(path))
+
+    return SnapshotPlan(
+        archive=archive,
+        skipped_recoverable=skipped_recoverable,
+        skipped_oversize=skipped_oversize,
+    )
 
 
 def create_snapshot(
@@ -181,6 +266,36 @@ def restore_snapshot(snapshot_id: str, *, root: Path | str) -> list[str]:
 
     logger.info("snapshot %s restored %d path(s)", snapshot_id, len(restored))
     return restored
+
+
+def _exceeds_cap(path: Path, cap: int) -> bool:
+    """True if ``path`` is larger than ``cap`` bytes (short-circuits early).
+
+    Directories are summed file-by-file and the walk stops the moment the cap
+    is crossed, so an oversized tree is never fully traversed. Symlinks are not
+    followed (the archive stores the link itself, not its target).
+
+    Example::
+
+        >>> _exceeds_cap(Path("/proj/node_modules"), 256 * 1024 * 1024)
+        True
+    """
+    if path.is_dir() and not path.is_symlink():
+        total = 0
+        for child in path.rglob("*"):
+            if child.is_symlink() or not child.is_file():
+                continue
+            try:
+                total += child.stat().st_size
+            except OSError:
+                continue
+            if total > cap:
+                return True
+        return False
+    try:
+        return path.lstat().st_size > cap
+    except OSError:
+        return False
 
 
 def _remove(path: Path) -> None:
