@@ -73,6 +73,48 @@ Domain floors:
   no import edge points at. Bounded source scan; floor
   `min(0.85, 0.45 + 0.05 × references)`.
 
+## Command classes & the eligibility filter
+
+Beyond the filesystem, blast-scope scores four more command classes — **git,
+docker, pip/uv, SQL** — through a uniform two-stage protocol in
+`src/blast_scope/classes/`. Each runs cheaply first, probes only when warranted:
+
+1. **triage** — a near-free check ("is this my class, and destructive?"). Pure
+   string/flag inspection, no subprocess. The common command matches nothing and
+   exits here.
+2. **assess** — only for triaged candidates. A strictly **read-only probe** when
+   available, else a **labeled heuristic estimate** (`estimated=True`). Returns a
+   `Consequence` floor, exactly like the analyzers above.
+
+A class earns a *live probe* only when both gates hold — this is the design
+boundary, not an implementation detail:
+
+- **Safe probe exists** — impact is observable by a side-effect-free read
+  (HTTP-GET sense: zero observable side effects). Never mutate state to assess
+  state. State-mutating "probes" (`terraform plan`, `kubectl --dry-run=server`)
+  are out of scope by construction.
+- **Authorable reversibility** — the undo story is well-known enough to encode
+  in a static per-class table, refined by the probe.
+
+Radius × reversibility is combined **per class** (there is no single global
+formula) — the floor each class emits already encodes its own treatment:
+
+| Class | Probe (read-only) | Floor logic (abridged) |
+|---|---|---|
+| **git** (`vcs.py` + `classes/git.py`) | `status` · `reflog` · `rev-list` · `rev-parse @{u}` | working-tree-scaled base; `push --force` escalates on a diverged/protected upstream; `branch -D` drops to ~0.25 when fully merged |
+| **docker** (`classes/docker.py`) | `volume inspect` · `ps -a` · `volume ls` | volume rm → 0.85–0.9 (data, no image to rebuild); container rm -f → ~0.4 (recreatable); `system prune --volumes` scales with unused-volume count |
+| **pip/uv** (`classes/packages.py`) | read lockfile/manifest (no subprocess) | lockfile present → 0.15 (regenerable); absent → 0.35 |
+| **SQL** (`classes/sql.py`) | SQLite `SELECT count(*)` `mode=ro`; transaction check | DROP 0.9 / TRUNCATE 0.85 / DELETE-no-WHERE 0.75; open transaction → ~0.6 (ROLLBACK-able); Postgres/MySQL → estimate |
+
+**Floor placement.** These are *state-tied* domains (the danger is in runtime
+state, not a filesystem path), so — like `vcs` — their floors apply **after** the
+recoverability caps and ungated (`_STATE_TIED_DOMAINS` in `risk_scorer.py`).
+Path-tied `infra`/`config` still apply before the caps.
+
+**Graceful degradation.** Probe → (missing daemon / no driver / timeout / error)
+labeled estimate → (triage error) silent. Analysis is advisory and must never
+block or delay a command on failure.
+
 ## Severity & recommendation
 
 | score      | severity  | recommendation |
@@ -86,12 +128,13 @@ Domain floors:
 
 ## Calibration
 
-`eval.py` runs the labeled corpus (`tests/fixtures/eval_corpus.jsonl`, 28 cases:
-12 low / 3 medium / 9 high / 4 critical, spanning every recoverability category,
-git clean-vs-dirty state, infra/config files, and a graph-indexed central
-module). Each case is materialized in a throwaway project — including git
-working-tree state and, when needed, a built dependency graph — then scored with
-the real `assess()`. It reports:
+`eval.py` runs the labeled corpus (`tests/fixtures/eval_corpus.jsonl`, 33 cases:
+14 low / 4 medium / 9 high / 5 critical, spanning every recoverability category,
+git clean-vs-dirty state, infra/config files, a graph-indexed central module, and
+the git/docker/pip/SQL classes — including degrade-to-estimate paths). Each case
+is materialized in a throwaway project — including git working-tree state and,
+when needed, a built dependency graph — then scored with the real `assess()`. It
+reports:
 
 - **exact severity** and **within-one-band** accuracy
 - **gate** precision/recall/F1 (proceed vs. flag, truth = not-low)
@@ -99,9 +142,9 @@ the real `assess()`. It reports:
 
 Run it: `python -m blast_scope.eval`.
 
-**Current calibration (2026-05-30):** 28/28 exact, 28/28 within-one-band, gate
-F1 1.00. `tests/test_eval.py` pins these with headroom (exact ≥ 0.85, within ≥
-0.95, F1 ≥ 0.9, and no critical-labeled command ever scored `proceed`) so future
+**Current calibration:** 33/33 exact, 33/33 within-one-band, gate F1 1.00.
+`tests/test_eval.py` pins these with headroom (exact ≥ 0.85, within ≥ 0.95,
+F1 ≥ 0.9, and no critical-labeled command ever scored `proceed`) so future
 tuning can't silently regress.
 
 Three calibration fixes came out of the first runs, all in `risk_scorer.py`:

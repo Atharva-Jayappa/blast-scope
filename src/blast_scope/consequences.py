@@ -38,9 +38,10 @@ class Consequence:
                     evidence="git reset --hard would discard 4 modified file(s)")
     """
 
-    domain: str  # "vcs" | "infra" | "config"
+    domain: str  # "vcs" | "infra" | "config" | "docker" | "packages" | "sql"
     floor: float  # minimum score this consequence justifies, 0.0 - 1.0
     evidence: str  # human-readable explanation
+    estimated: bool = False  # True when derived from a heuristic, not a live probe
 
 
 def gather(
@@ -68,13 +69,14 @@ def gather(
     """
     # Local imports keep this module a dependency-cycle-free leaf: the
     # analyzers import ``Consequence`` from here.
-    from blast_scope import config_refs, infra, vcs
+    from blast_scope import config_refs, infra
+    from blast_scope.classes import gather_classes
 
     out: list[Consequence] = []
 
-    git_c = vcs.analyze_git(parsed, raw, cwd)
-    if git_c is not None:
-        out.append(git_c)
+    # Command-class analyzers (git, and — as they land — docker/packages/sql):
+    # each triages cheaply, then probes only flagged destructive candidates.
+    out.extend(gather_classes(parsed, raw, cwd))
 
     for target in parsed["targets"]:
         path = Path(target)

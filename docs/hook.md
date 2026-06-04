@@ -18,6 +18,14 @@ If a critical command turns out to be a mistake, its snapshot can be restored �
 even for files git can't recover (untracked, `.env`, `*.tfstate`, git-ignored
 dirs).
 
+The severity it tiers on comes from the full multi-class engine: filesystem
+(dependency graph + git), plus **git / docker / pip·uv / SQL** command classes,
+each scored from a strictly read-only probe (or a labeled estimate when no probe
+is available — e.g. `docker volume rm` with no daemon, or `DROP TABLE` against a
+remote Postgres). So `docker volume rm pgdata` or `psql -c "DROP TABLE users"`
+reaches the advisory the same way `rm -rf ./config` does. See
+[heuristics.md](heuristics.md#command-classes--the-eligibility-filter).
+
 ### Snapshot policy
 
 The snapshot is the actual safety net, so it stays fast and trustworthy by

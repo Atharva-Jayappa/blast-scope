@@ -2,85 +2,121 @@
 
 **A consequence engine for shell commands.** Blast Scope scores what a command
 would actually *do* — before an AI agent (or you) runs it. It doesn't pattern-match
-on syntax; it resolves targets against a dependency graph, the git working tree,
-secret/data classification, and infrastructure context, then returns a structured
-risk score with evidence.
+syntax into a blocklist; it figures out the command's **real target**, observes
+that target with a **safe, read-only probe**, and returns a structured risk score
+with evidence.
 
-The whole point is contextual blast radius. The *same command* gets a completely
-different score depending on what it would hit:
+The whole point is *contextual* blast radius. The **same command** gets a
+completely different score depending on what it would actually hit:
 
 ```
-rm -rf ./logs        →  LOW       0 importers, regenerable, outside src tree.        proceed
-rm -rf ./config      →  CRITICAL  8 modules import it, high PageRank centrality.     block
-rm .env              →  CRITICAL  secret, unrecoverable — even with 0 importers.     block
-git reset --hard     →  LOW       working tree is clean — nothing to discard.        proceed
-git reset --hard     →  HIGH      would discard 4 files with uncommitted changes.    confirm
+COMMAND                            SEVERITY   WHY                                          ADVICE
+─────────────────────────────────  ────────   ──────────────────────────────────────────  ───────
+rm -rf ./logs                      LOW        0 importers · regenerable · outside src      proceed
+rm -rf ./config                    CRITICAL   8 modules import it · high PageRank hub      block
+git reset --hard   (clean tree)    LOW        nothing uncommitted to discard               proceed
+git reset --hard   (4 dirty files) HIGH       would throw away 4 files of uncommitted work confirm
+git push --force   (protected)     CRITICAL   would orphan commits on a protected branch   block
+docker volume rm cache  (absent)   LOW        volume doesn't exist — nothing to remove     proceed
+docker volume rm pgdata (in use)   CRITICAL   holds data · in use · no image to rebuild    block
+pip uninstall flask     (uv.lock)  LOW        regenerable — exact version pinned in lock   proceed
+DROP TABLE users        (42 rows)  CRITICAL   schema + 42 rows · irreversible              block
+DELETE FROM logs        (in txn)   HIGH       no WHERE — but inside a txn, ROLLBACK-able    confirm
 ```
+
+Two commands can be byte-identical and score four bands apart. **That gap is the
+product.**
 
 > Not a blocklist. Not a replacement for Shellfirm. Not a syscall monitor. It
-> scores *structural consequence* — and for risky commands it captures an undo
-> snapshot first.
+> scores *structural consequence* — advisory, never blocking — and for the rare
+> critical command it captures an undo snapshot first.
 
 ---
 
 ## How it works
 
+A command flows through a cheap funnel: almost everything is recognized as
+non-destructive in microseconds and exits silent. Only a flagged *destructive
+candidate* pays for a probe.
+
 ```
-shell command
-     │
-     ▼
-┌─────────────┐   split chains (&& || ; |), de-alias PowerShell cmdlets,
-│   parse     │   classify intent + flags (rm -rf ≠ rm, > ≠ >>)
-└─────┬───────┘
-      │ targets, flags, intent
+  shell command
+      │   split chains (&& || ; |) · de-alias PowerShell · parse flags/targets
       ▼
-┌──────────────────────────── score (two axes) ────────────────────────────┐
-│                                                                           │
-│   blast radius                              recoverability                │
-│   ────────────                              ──────────────                │
-│   command_weight                            git tracked / dirty           │
-│   × structural   ←── dependency graph       regenerable (node_modules)    │
-│      (in-degree, PageRank centrality)       secret (.env/.pem/id_rsa)     │
-│                                             precious (*.tfstate/*.db)     │
-│                                                                           │
-│              ÷  reversibility_factor  ──────────────┘                     │
-│                                                                           │
-│   + out-of-graph consequences (floors):                                   │
-│       VCS   — git reset/clean/push --force, scaled by working-tree state  │
-│       infra — Dockerfile, Terraform, k8s, CI configs                      │
-│       config— files loaded by path string the import graph can't see      │
-└─────────────────────────────────┬─────────────────────────────────────────┘
-                                   ▼
-        score 0.0–1.0 → severity (low/medium/high/critical) → recommendation
-                                   │
-                                   ▼
-     PreToolUse hook: tiered by severity — silent (low/med) → advise (high)
-                 → advise + snapshot (critical, undoable)
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  STAGE 1 · triage  (near-free regex — runs on every command)          │
+  │     which class?   git · docker · pip/uv · sql · else filesystem       │
+  │     destructive?   `git status` → no.   `git reset --hard` → yes ↓     │
+  └───────────────────────────────┬──────────────────────────────────────┘
+                    destructive candidate │   (everything else exits here, silent)
+                                          ▼
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  ELIGIBILITY FILTER   safe read-only probe?   AND   undo authorable?   │
+  └──────────────┬──────────────────────────────────────┬─────────────────┘
+         yes, probe it │                       no probe here / now │
+                       ▼                                           ▼
+   STAGE 2 · safe probe (read-only)                    heuristic estimate
+     git  status · reflog · rev-list                   from a static per-class
+     docker  inspect · ps · ls                          table — and LABELED
+     sqlite  SELECT count(*)  [mode=ro]                  "(estimated)" so you
+     pip/uv  read lockfiles                              know it wasn't probed
+                       │                                           │
+                       └─────────────────────┬─────────────────────┘
+                                              ▼
+        blast radius  ×  reversibility   (combined PER CLASS — no global formula)
+        filesystem also folds in: dependency-graph centrality + recoverability
+                                              ▼
+              score 0.0–1.0  →  severity (low / medium / high / critical)
+                                              ▼
+        PreToolUse hook:  silent (low/med) · advise (high) · advise + snapshot (critical)
 ```
 
-See [docs/heuristics.md](docs/heuristics.md) for the exact formula, weight tables,
-and calibration.
+**The eligibility filter is the design boundary.** A command class earns a *live
+probe* only when both hold: (1) its impact is observable by a **strictly
+side-effect-free read** (HTTP-GET sense — never mutate state to assess state),
+and (2) its undo story is well-known enough to encode in a static table. When a
+probe can't run here and now (no docker daemon, no DB driver, no creds), the tool
+degrades to a labeled estimate — it never guesses silently, and it never blocks.
+
+See [docs/heuristics.md](docs/heuristics.md) for the per-class tables, the exact
+filesystem formula, and calibration.
+
+### The five command classes
+
+| Class | Destructive ops it scores | Safe (read-only) probe | Reversibility signal |
+|---|---|---|---|
+| **Filesystem** | `rm -rf`, `mv`, `>` truncate | dependency graph + git status | git-tracked? regenerable? secret? precious? |
+| **Git** | `reset --hard`, `push --force`, `branch -D`, `clean -fdx` | `status` · `reflog` · `rev-list` · `rev-parse @{u}` | reflog window · remote ahead · protected branch |
+| **Docker** | `volume rm`, `system prune -a`, `rm -f` | `volume inspect` · `ps -a` · `volume ls` | volume → none · container → recreatable from image |
+| **pip / uv** | `pip uninstall`, `uv pip uninstall` | read lockfile / manifest (no subprocess) | lockfile present → fully regenerable |
+| **SQL** | `DROP`, `TRUNCATE`, `DELETE` without `WHERE` | SQLite: `SELECT count(*)` `mode=ro`; transaction check | inside a transaction? backup posture? |
+
+New classes drop in behind one protocol (`triage` / `probe_commands` / `assess`)
+in [`src/blast_scope/classes/`](src/blast_scope/classes); the probe surface each
+declares is asserted read-only by the test suite, so no probe can ever mutate.
 
 ---
 
 ## Status
 
-**v0.1.0 — working end-to-end, not yet on PyPI.** Built in four phases:
+**v0.2.0 — multi-class consequence guardrail, working end-to-end, not yet on PyPI.**
 
 | Capability | Module |
 |---|---|
 | Flag/operand-sensitive command model (POSIX **and** PowerShell) | `command_effects.py`, `command_parser.py` |
 | Recoverability classification (git state, secrets, regenerable, precious data) | `recoverability.py` |
 | Dependency graph + weighted **PageRank** centrality, incremental indexing | `graph_resolver.py`, `centrality.py` |
-| Two-axis, evidence-based scoring | `risk_scorer.py` |
-| Out-of-graph **consequence analyzers** (VCS / infra / config-by-path) | `consequences.py`, `vcs.py`, `infra.py`, `config_refs.py` |
+| Two-axis, evidence-based filesystem scoring | `risk_scorer.py` |
+| **Command-class probes** — git / docker / pip·uv / SQL, behind one protocol | `classes/` |
+| Out-of-graph **path analyzers** (infra / config-by-path) + git base | `consequences.py`, `vcs.py`, `infra.py`, `config_refs.py` |
 | **PreToolUse hook** + tarball **snapshot/undo** | `hook.py`, `snapshot.py` |
 | **Eval harness** + labeled corpus + calibration | `eval.py`, `tests/fixtures/eval_corpus.jsonl` |
 
-**Calibration (2026-05-30):** on a 28-case labeled corpus spanning every
-recoverability category, git state, infra/config files, and a graph-indexed
-case — **28/28 exact severity, gate F1 1.00.** `tests/test_eval.py` pins these
-with headroom so future changes can't silently regress. Run it yourself:
+**Calibration:** on a 33-case labeled corpus spanning every recoverability
+category, git working-tree state, infra/config files, a graph-indexed central
+module, and the new git/docker/pip/SQL classes — **33/33 exact severity, gate
+F1 1.00.** `tests/test_eval.py` pins these with headroom so future changes can't
+silently regress. Run it yourself:
 
 ```bash
 uv run python -m blast_scope.eval
@@ -152,6 +188,8 @@ Full details and the undo flow: [docs/hook.md](docs/hook.md).
 
 ## Example output
 
+A filesystem command, scored against the dependency graph:
+
 ```jsonc
 // assess_command("rm -rf ./config", project_root="/proj")
 {
@@ -169,6 +207,23 @@ Full details and the undo flow: [docs/hook.md](docs/hook.md).
   "affected_nodes": [ /* ... */ ],
   "chain": [ /* per-segment breakdown */ ]
 }
+```
+
+A command class that couldn't probe — note the **labeled estimate** (no
+Postgres driver, server possibly remote, so the tool refuses to guess silently):
+
+```jsonc
+// assess_command('psql -c "DROP TABLE users"')
+{
+  "score": 0.9,
+  "severity": "critical",
+  "recommendation": "block",
+  "evidence": [
+    "drops users — its schema and all rows, irreversible (estimated — no read-only probe for postgres)"
+  ]
+}
+// the same DROP against a local SQLite file probes for real:
+//   "drops users — its schema and 42 row(s), irreversible"   (estimated: false)
 ```
 
 ---
@@ -193,16 +248,22 @@ blast-scope/
 │   ├── graph_resolver.py    # paths → dependency-graph impact (+ PageRank)
 │   ├── centrality.py        # pure-Python weighted PageRank
 │   ├── risk_scorer.py       # signals → score + severity + evidence
-│   ├── consequences.py      # coordinator for out-of-graph analyzers
-│   ├── vcs.py / infra.py / config_refs.py   # consequence analyzers
+│   ├── classes/             # command-class probes behind one protocol
+│   │   ├── __init__.py      #   Candidate · ConsequenceClass · registry
+│   │   ├── git.py           #   reflog / upstream-divergence / protected branch
+│   │   ├── docker.py        #   volume / container / system-prune probes
+│   │   ├── packages.py      #   pip·uv uninstall vs. lockfile presence
+│   │   └── sql.py           #   DROP/TRUNCATE/DELETE — SQLite probe + estimates
+│   ├── consequences.py      # coordinator: class probes + path analyzers
+│   ├── vcs.py / infra.py / config_refs.py   # git base + path analyzers
 │   ├── hook.py              # PreToolUse advisory hook
 │   ├── snapshot.py          # tarball snapshot / restore / list
 │   ├── eval.py              # evaluation harness + metrics
 │   └── vendor/crg/          # vendored from code-review-graph (MIT)
-├── tests/                   # 230+ tests incl. eval regression guard
+├── tests/                   # 295+ tests incl. eval regression guard
 │   └── fixtures/eval_corpus.jsonl   # labeled calibration corpus
 └── docs/
-    ├── heuristics.md        # scoring model + calibration
+    ├── heuristics.md        # scoring model + per-class tables + calibration
     └── hook.md              # hook registration + undo
 ```
 
@@ -210,7 +271,9 @@ blast-scope/
 
 ## Roadmap
 
-- Calibrate against a larger, real-world corpus (current corpus is 28 cases).
+- Calibrate against a larger, real-world corpus (current corpus is 33 cases).
+- Optional live probes for Postgres/MySQL (in-process, read-only) once a driver
+  policy is settled — today those engines degrade to labeled estimates.
 - PowerShell-shell awareness in the hook path (the MCP tool already supports it).
 - Optional richer interception modes beyond advisory.
 

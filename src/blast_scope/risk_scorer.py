@@ -97,6 +97,14 @@ class ChainAssessment(TypedDict):
 # Scoring constants
 # ---------------------------------------------------------------------------
 
+# Consequence domains whose danger lives in *state*, not in a filesystem path
+# (git working tree, a docker volume, a package env, a SQL table). Their floors
+# apply AFTER the recoverability caps and ungated, because the command's operand
+# isn't a path the caps reason about — otherwise the bogus `absent` cap (from
+# treating e.g. a git subcommand token as a missing file) would crush a real
+# consequence. Path-tied domains (infra/config) stay BEFORE the caps.
+_STATE_TIED_DOMAINS: frozenset[str] = frozenset({"vcs", "docker", "packages", "sql"})
+
 # In-degree normalization ceiling (10+ importers = max risk)
 _IN_DEGREE_CEILING: int = 10
 
@@ -196,7 +204,8 @@ def score_risk(
     # a read (`cat config.yaml`) isn't raised.
     if consequences and parsed["intent"] != "read":
         path_floor = max(
-            (c.floor for c in consequences if c.domain != "vcs"), default=0.0
+            (c.floor for c in consequences if c.domain not in _STATE_TIED_DOMAINS),
+            default=0.0,
         )
         score = max(score, path_floor)
 
@@ -218,16 +227,17 @@ def score_risk(
             # unknown file is at least a medium concern when it's gone for good.
             score = max(score, 0.2)
 
-    # VCS consequences are orthogonal to the target *path* — the danger is in
-    # the working-tree/history state, not the operand (git's "targets" are
-    # subcommands/refs, not files). So apply them AFTER the recoverability caps,
-    # and ungated: vcs.analyze_git only fires for genuinely destructive ops
-    # (reset --hard, clean -f, push --force…), never for git status/log.
+    # State-tied consequences (git working tree, docker volumes, package envs,
+    # SQL tables) are orthogonal to the target *path* — the danger is in runtime
+    # state, not the operand (git's "targets" are subcommands/refs, not files).
+    # So apply them AFTER the recoverability caps, and ungated: each class only
+    # emits a consequence for a genuinely destructive op, never for a read.
     if consequences:
-        vcs_floor = max(
-            (c.floor for c in consequences if c.domain == "vcs"), default=0.0
+        state_floor = max(
+            (c.floor for c in consequences if c.domain in _STATE_TIED_DOMAINS),
+            default=0.0,
         )
-        score = max(score, vcs_floor)
+        score = max(score, state_floor)
 
     # Severity mapping
     severity = _score_to_severity(score)

@@ -26,3 +26,8 @@
 {"id": "rm_pem_secret", "command": "rm server.pem", "setup": {"files": {"server.pem": "-----BEGIN-----\n"}}, "expected": "critical", "note": "private key"}
 {"id": "rm_id_rsa", "command": "rm id_rsa", "setup": {"files": {"id_rsa": "key\n"}}, "expected": "critical", "note": "ssh private key"}
 {"id": "rm_config_py_graph", "command": "rm config.py", "index": true, "setup": {"files": {"main.py": "import config\nimport db\n", "db.py": "import config\n", "config.py": "VALUE = 1\n"}}, "expected": "critical", "note": "central module, 2 importers via graph"}
+{"id": "pip_uninstall_locked", "command": "pip uninstall flask", "setup": {"files": {"uv.lock": "# lock\n"}}, "expected": "low", "note": "regenerable from lockfile"}
+{"id": "pip_uninstall_unlocked", "command": "pip uninstall requests", "expected": "medium", "note": "no lockfile, exact version unknown"}
+{"id": "sql_drop_postgres", "command": "psql -c \"DROP TABLE users\"", "expected": "critical", "note": "DROP estimate, no probe available"}
+{"id": "sql_delete_no_where", "command": "mysql -e \"DELETE FROM events\"", "expected": "high", "note": "DELETE without WHERE, estimate"}
+{"id": "sql_delete_with_where", "command": "psql -c \"DELETE FROM events WHERE id = 5\"", "expected": "low", "note": "scoped DELETE is benign"}
