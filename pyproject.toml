@@ -1,19 +1,43 @@
 [project]
 name = "blast-scope"
-version = "0.1.0"
-description = "MCP tool that scores the blast radius of shell commands using dependency graph analysis"
+version = "0.3.0"
+description = "Contextual blast-radius scoring for shell commands an AI agent is about to run"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Atharva Jayappa", email = "jatharva289@gmail.com" }]
+keywords = [
+    "mcp", "ai-agents", "claude-code", "shell", "safety",
+    "guardrail", "blast-radius", "dependency-graph",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Software Development :: Quality Assurance",
+]
 dependencies = [
     "mcp>=1.0.0,<2",
     "tree-sitter>=0.23.0,<1",
     "tree-sitter-language-pack>=0.3.0,<1",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Atharva-Jayappa/blast-scope"
+Repository = "https://github.com/Atharva-Jayappa/blast-scope"
+Issues = "https://github.com/Atharva-Jayappa/blast-scope/issues"
+
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [project.scripts]
 blast-scope = "blast_scope.server:main"
+blast-scope-hook = "blast_scope.hook:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -1,0 +1,13 @@
+{
+  "name": "blast-scope",
+  "owner": { "name": "Atharva Jayappa", "url": "https://github.com/Atharva-Jayappa" },
+  "plugins": [
+    {
+      "name": "blast-scope",
+      "source": "./",
+      "description": "Contextual blast-radius scoring for shell commands — an advisory PreToolUse guardrail plus MCP tools (assess / snapshots / restore).",
+      "version": "0.3.0",
+      "category": "security"
+    }
+  ]
+}

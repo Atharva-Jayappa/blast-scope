@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "blast-scope": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["blast-scope"],
+      "env": { "PYTHONUNBUFFERED": "1" }
+    }
+  }
+}

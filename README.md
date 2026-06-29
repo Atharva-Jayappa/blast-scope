@@ -1,5 +1,7 @@
 # Blast Scope
 
+<!-- mcp-name: io.github.atharva-jayappa/blast-scope -->
+
 **A consequence engine for shell commands.** Blast Scope scores what a command
 would actually *do* — before an AI agent (or you) runs it. It doesn't pattern-match
 syntax into a blocklist; it figures out the command's **real target**, observes
@@ -99,7 +101,7 @@ declares is asserted read-only by the test suite, so no probe can ever mutate.
 
 ## Status
 
-**v0.2.0 — multi-class consequence guardrail, working end-to-end, not yet on PyPI.**
+**v0.3.0 — calibrated multi-class guardrail with a precise dependency graph.**
 
 | Capability | Module |
 |---|---|
@@ -112,30 +114,47 @@ declares is asserted read-only by the test suite, so no probe can ever mutate.
 | **PreToolUse hook** + tarball **snapshot/undo** | `hook.py`, `snapshot.py` |
 | **Eval harness** + labeled corpus + calibration | `eval.py`, `tests/fixtures/eval_corpus.jsonl` |
 
-**Calibration:** on a 33-case labeled corpus spanning every recoverability
-category, git working-tree state, infra/config files, a graph-indexed central
-module, and the new git/docker/pip/SQL classes — **33/33 exact severity, gate
-F1 1.00.** `tests/test_eval.py` pins these with headroom so future changes can't
-silently regress. Run it yourself:
+**Calibration.** Two harnesses, both run-it-yourself:
+
+- **In-repo corpus** (`tests/fixtures/eval_corpus.jsonl`, 38 cases spanning every
+  recoverability category, git working-tree state, infra/config, `rm -rf .git`,
+  a graph-indexed central module, and the git/docker/pip/SQL classes) —
+  **38/38 exact severity, gate F1 1.00**, pinned by `tests/test_eval.py` with
+  headroom so changes can't silently regress.
+- **[SABER](https://github.com/sssr-lab/saber)** — 716 real coding-agent
+  workspaces. Against ~1725 safe commands, blast-scope's **false-positive rate is
+  0.4%**; on its core competency (`data_destruction`) it catches **82%** of
+  injected attacks, on realistic workspaces. The honest per-category recall (low
+  on out-of-scope exfiltration/persistence — a different threat model) is the
+  probe roadmap. See [`bench/`](bench).
 
 ```bash
-uv run python -m blast_scope.eval
+uv run python -m blast_scope.eval                 # in-repo corpus
+python bench/saber_eval.py --tasks <saber>/dataset/data/tasks.jsonl   # SABER
 ```
 
 ---
 
 ## Installation
 
+The fastest path for any MCP client is zero-install via `uvx` (no clone, no venv):
+
 ```bash
-git clone https://github.com/Atharva-Jayappa/blast-scope.git
-cd blast-scope
-uv sync --all-extras
+uvx blast-scope        # runs the MCP server on stdio
 ```
 
-Or directly:
+**Claude Code users — one line wires up both the MCP tools and the advisory hook:**
 
 ```bash
-uv pip install git+https://github.com/Atharva-Jayappa/blast-scope.git
+/plugin marketplace add Atharva-Jayappa/blast-scope
+/plugin install blast-scope
+```
+
+For development, or to pin a checkout:
+
+```bash
+git clone https://github.com/Atharva-Jayappa/blast-scope.git
+cd blast-scope && uv sync --all-extras
 ```
 
 ---
@@ -149,7 +168,7 @@ Add to your MCP client config (e.g. Claude Code `settings.json`):
 ```json
 {
   "mcpServers": {
-    "blast-scope": { "command": "blast-scope", "type": "stdio" }
+    "blast-scope": { "command": "uvx", "args": ["blast-scope"], "type": "stdio" }
   }
 }
 ```
