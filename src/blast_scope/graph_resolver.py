@@ -16,12 +16,17 @@ from pathlib import Path, PurePosixPath
 from typing import TypedDict
 
 from blast_scope import centrality
+from blast_scope.import_resolver import build_import_graph, reverse_graph
 from blast_scope.vendor.crg import CodeParser, GraphStore, NodeInfo, EdgeInfo
 
 logger = logging.getLogger(__name__)
 
 # Metadata key under which the file-level PageRank map is cached in the graph DB.
 _PAGERANK_META_KEY = "pagerank_by_file"
+# Precise stdlib-``ast`` file→file import graph (forward: importer → imported).
+# When present it is the authoritative blast-radius signal (in-degree + PageRank),
+# replacing the tree-sitter parser's name-matched edges.
+_IMPORT_GRAPH_META_KEY = "import_graph"
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +108,7 @@ class GraphResolver:
         self._parser = CodeParser()
         self._store: GraphStore | None = None
         self._pagerank: dict[str, float] | None = None
+        self._import_reverse: dict[str, list[str]] | None = None
 
     def _get_store(self) -> GraphStore:
         """Lazily initialize the graph store."""
@@ -155,14 +161,50 @@ class GraphResolver:
         for stale in existing_hashes.keys() - seen:
             store.remove_file_data(stale)
 
-        self._recompute_pagerank(store)
+        self._recompute_centrality(store)
 
-    def _recompute_pagerank(self, store: GraphStore) -> None:
-        """Compute weighted PageRank over all edges and cache it per file.
+    def _recompute_centrality(self, store: GraphStore) -> None:
+        """Recompute the precise import graph and file-level PageRank.
+
+        The precise stdlib-``ast`` import graph is the authoritative blast-radius
+        signal. When the project has resolvable Python imports it drives both
+        in-degree and PageRank (file→file edges, so centrality is computed
+        directly at file granularity). A project with no resolvable Python
+        imports (non-Python, or scripts) falls back to the tree-sitter graph so
+        the signal never silently vanishes. Both are cached in the DB metadata.
+        """
+        py_files = [
+            self._project_root / Path(rel)
+            for rel in (self._to_graph_path(p) for p in self._walk_sources())
+            if rel.endswith(".py")
+        ]
+        forward = build_import_graph(self._project_root, py_files)
+
+        if forward:
+            store.set_metadata(_IMPORT_GRAPH_META_KEY, json.dumps(forward))
+            self._import_reverse = reverse_graph(forward)
+            triples = [
+                (importer, imported, "IMPORTS_FROM")
+                for importer, imported_list in forward.items()
+                for imported in imported_list
+            ]
+            # Nodes are file paths already — PageRank is file-level directly.
+            file_scores = centrality.pagerank(triples)
+            peak = max(file_scores.values(), default=0.0)
+            if peak > 0.0:
+                file_scores = {f: s / peak for f, s in file_scores.items()}
+            store.set_metadata(_PAGERANK_META_KEY, json.dumps(file_scores))
+            self._pagerank = file_scores
+        else:
+            store.set_metadata(_IMPORT_GRAPH_META_KEY, json.dumps({}))
+            self._import_reverse = {}
+            self._tree_sitter_pagerank(store)
+
+    def _tree_sitter_pagerank(self, store: GraphStore) -> None:
+        """Fallback PageRank over the tree-sitter node graph (non-Python projects).
 
         Node-level centrality is aggregated to the file level (summed, then
-        normalized so the most central file is 1.0) and persisted in the
-        graph DB's metadata so scoring stays a cheap lookup.
+        normalized so the most central file is 1.0).
         """
         triples = [
             (e.source_qualified, e.target_qualified, e.kind)
@@ -188,6 +230,35 @@ class GraphResolver:
             raw = self._get_store().get_metadata(_PAGERANK_META_KEY)
             self._pagerank = json.loads(raw) if raw else {}
         return self._pagerank
+
+    def _import_reverse_map(self) -> dict[str, list[str]]:
+        """Lazily load the reverse precise import graph (imported → importers).
+
+        Empty when the graph predates Track C or the project has no resolvable
+        Python imports — callers then fall back to the tree-sitter in-degree.
+        """
+        if self._import_reverse is None:
+            raw = self._get_store().get_metadata(_IMPORT_GRAPH_META_KEY)
+            forward = json.loads(raw) if raw else {}
+            self._import_reverse = reverse_graph(forward)
+        return self._import_reverse
+
+    def _in_degree(self, rel_path: str, nodes_in_file: list[str], store: GraphStore) -> int:
+        """Importers of a file: precise import graph if present, else tree-sitter.
+
+        Precise = the number of *distinct files* that import this one — exactly
+        the "N modules import config.py" claim. The tree-sitter fallback counts
+        cross-file edges into the file's nodes (name-matched, noisier).
+        """
+        rev = self._import_reverse_map()
+        if rev:
+            return len(rev.get(rel_path, []))
+        return sum(
+            1
+            for qn in nodes_in_file
+            for e in store.get_edges_by_target(qn)
+            if e.file_path != rel_path
+        )
 
     def resolve_path(self, target: Path) -> GraphResolution:
         """Resolve a single filesystem path to its graph impact.
@@ -241,14 +312,9 @@ class GraphResolver:
                 )
             )
 
-        # in_degree = number of edges pointing TO nodes in this file
-        in_degree = 0
-        for qn in nodes_in_file:
-            edges = store.get_edges_by_target(qn)
-            # Only count edges from OTHER files
-            in_degree += sum(
-                1 for e in edges if e.file_path != rel_path
-            )
+        # in_degree = how many other files depend on this one (precise import
+        # graph when available, tree-sitter fallback otherwise).
+        in_degree = self._in_degree(rel_path, nodes_in_file, store)
 
         return GraphResolution(
             target_path=str(target),
