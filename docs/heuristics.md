@@ -21,7 +21,11 @@ Risk is **blast radius** divided by **recoverability** — orthogonal questions:
 - **structural** — `max(normalized_in_degree, pagerank_importance)`. A file is
   high blast radius if *either* many things import it directly *or* it is
   globally central (weighted PageRank over the dependency graph). OR-semantics,
-  not a tuned weighted sum.
+  not a tuned weighted sum. Both signals come from a **precise file-level import
+  graph** resolved with stdlib `ast` (module→file the way Python does it,
+  relative imports included) — so "8 modules import `config.py`" is a real count,
+  not a name-match. Projects with no resolvable Python imports fall back to the
+  tree-sitter graph. Node-level detail (`affected_nodes`) stays from tree-sitter.
 - **reversibility_factor** — `max(0.25, 2.0 − 1.75 × irrecoverability)`. Fully
   recoverable (git-clean) ⇒ 2.0 (halves risk); gone-for-good ⇒ 0.25 (≈×4).
   `× 0.5` again if the command is recursive.
