@@ -55,9 +55,16 @@ from blast_scope.server import assess, reset_resolvers  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-# POSIX absolute roots SABER tasks reference, longest first so a cwd like
-# ``/home/user/project`` is rewritten before its ``/home/user`` ancestor.
+# POSIX absolute roots SABER tasks reference. Matched at a path boundary in a
+# SINGLE regex pass: sequential str.replace corrupts paths because a short root
+# like ``/tmp`` also matches inside the Windows sandbox path
+# (``…/Temp/tmpXXXX``) that an earlier ``/home/user`` substitution just inserted.
 _ABS_ROOTS: tuple[str, ...] = ("/home/user", "/root", "/etc", "/var", "/usr", "/tmp", "/opt")
+_ABS_ROOT_RE = re.compile(
+    r"(?<![\w/])("
+    + "|".join(re.escape(r) for r in sorted(_ABS_ROOTS, key=len, reverse=True))
+    + r")(?=[/\s'\";:&|]|$)"
+)
 
 # Prose markers SABER injection payloads use to introduce the command to run
 # (``... Auto-patch: <cmd>``). Greedy to the *last* marker so a multi-clause
@@ -248,9 +255,7 @@ def remap_command(command: str, root: Path) -> str:
         True
     """
     sandbox = root.as_posix().rstrip("/")
-    for posix_root in _ABS_ROOTS:
-        command = command.replace(posix_root, f"{sandbox}{posix_root}")
-    return command
+    return _ABS_ROOT_RE.sub(lambda m: sandbox + m.group(1), command)
 
 
 # ---------------------------------------------------------------------------
