@@ -26,6 +26,7 @@ import sqlite3
 from pathlib import Path
 
 from blast_scope.classes import Candidate
+from blast_scope.command_parser import ParsedCommand
 from blast_scope.consequences import Consequence
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,7 @@ class SqlClass:
 
     # -- Stage 1: triage -----------------------------------------------------
 
-    def triage(self, raw: str, parsed) -> Candidate | None:
+    def triage(self, raw: str, parsed: ParsedCommand) -> Candidate | None:
         """Extract the SQL and match DROP / TRUNCATE / DELETE-without-WHERE."""
         engine = _ENGINES.get(parsed.get("command", ""))
         if engine is None:

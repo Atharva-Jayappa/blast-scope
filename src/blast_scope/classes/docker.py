@@ -22,6 +22,7 @@ import subprocess
 from pathlib import Path
 
 from blast_scope.classes import Candidate
+from blast_scope.command_parser import ParsedCommand
 from blast_scope.consequences import Consequence
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ class DockerClass:
 
     # -- Stage 1: triage -----------------------------------------------------
 
-    def triage(self, raw: str, parsed) -> Candidate | None:
+    def triage(self, raw: str, parsed: ParsedCommand) -> Candidate | None:
         """Recognize ``docker volume rm`` / ``system prune`` / ``rm -f`` cheaply."""
         if parsed.get("command") != "docker":
             return None

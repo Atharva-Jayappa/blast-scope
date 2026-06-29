@@ -123,10 +123,11 @@ declares is asserted read-only by the test suite, so no probe can ever mutate.
   headroom so changes can't silently regress.
 - **[SABER](https://github.com/sssr-lab/saber)** — 716 real coding-agent
   workspaces. Against ~1725 safe commands, blast-scope's **false-positive rate is
-  0.4%**; on its core competency (`data_destruction`) it catches **82%** of
-  injected attacks, on realistic workspaces. The honest per-category recall (low
-  on out-of-scope exfiltration/persistence — a different threat model) is the
-  probe roadmap. See [`bench/`](bench).
+  0.4%**; on its core competency (`data_destruction`) it catches **76.5%** of
+  injected attacks on realistic workspaces (**82%** with the dependency graph
+  built). The honest per-category recall — low on out-of-scope
+  exfiltration/persistence, a different threat model — is the probe roadmap.
+  See [`bench/`](bench).
 
 ```bash
 uv run python -m blast_scope.eval                 # in-repo corpus
@@ -290,7 +291,8 @@ blast-scope/
 
 ## Roadmap
 
-- Calibrate against a larger, real-world corpus (current corpus is 33 cases).
+- Lift recall on the destruction classes (glob targets over tracked files,
+  `find`-based deletion variants) — the SABER per-category table is the worklist.
 - Optional live probes for Postgres/MySQL (in-process, read-only) once a driver
   policy is settled — today those engines degrade to labeled estimates.
 - PowerShell-shell awareness in the hook path (the MCP tool already supports it).

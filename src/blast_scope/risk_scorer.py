@@ -12,7 +12,7 @@ from typing import TypedDict
 
 from blast_scope.command_effects import command_weight as _effect_weight
 from blast_scope.command_parser import ParsedCommand
-from blast_scope.consequences import Consequence, max_floor
+from blast_scope.consequences import Consequence
 from blast_scope.graph_resolver import GraphResolution, ResolvedNode
 from blast_scope.recoverability import Recoverability
 

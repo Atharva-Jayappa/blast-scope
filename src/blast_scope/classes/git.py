@@ -27,6 +27,7 @@ from pathlib import Path
 
 from blast_scope import vcs
 from blast_scope.classes import Candidate
+from blast_scope.command_parser import ParsedCommand
 from blast_scope.consequences import Consequence
 
 logger = logging.getLogger(__name__)
@@ -50,7 +51,7 @@ class GitClass:
 
     # -- Stage 1: triage (pure, no subprocess) ------------------------------
 
-    def triage(self, raw: str, parsed) -> Candidate | None:
+    def triage(self, raw: str, parsed: ParsedCommand) -> Candidate | None:
         """Classify a git command as a destructive operation, cheaply.
 
         Mirrors the destructive conditions in :func:`blast_scope.vcs.analyze_git`

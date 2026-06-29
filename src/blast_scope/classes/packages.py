@@ -18,6 +18,7 @@ import shlex
 from pathlib import Path
 
 from blast_scope.classes import Candidate
+from blast_scope.command_parser import ParsedCommand
 from blast_scope.consequences import Consequence
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,7 @@ class PackagesClass:
 
     # -- Stage 1: triage -----------------------------------------------------
 
-    def triage(self, raw: str, parsed) -> Candidate | None:
+    def triage(self, raw: str, parsed: ParsedCommand) -> Candidate | None:
         """Recognize ``pip uninstall`` / ``uv pip uninstall`` cheaply."""
         cmd = parsed.get("command")
         tokens = _tokens(raw)

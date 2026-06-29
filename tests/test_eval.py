@@ -2,7 +2,7 @@
 
 These tests pin the scorer's accuracy against the labeled corpus so a future
 change to any threshold can't silently degrade quality. Thresholds sit *below*
-the current calibrated numbers (28/28 exact, F1 1.00) to leave headroom for
+the current calibrated numbers (38/38 exact, F1 1.00) to leave headroom for
 intentional tuning while still catching real regressions.
 """
 

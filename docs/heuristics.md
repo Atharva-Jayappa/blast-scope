@@ -140,7 +140,7 @@ block or delay a command on failure.
 
 ## Calibration
 
-`eval.py` runs the labeled corpus (`tests/fixtures/eval_corpus.jsonl`, 35 cases
+`eval.py` runs the labeled corpus (`tests/fixtures/eval_corpus.jsonl`, 38 cases
 spanning every recoverability category — including `repo_history` (`rm -rf .git`)
 and a tracked-file control — git clean-vs-dirty state, infra/config files, a
 graph-indexed central module, and the git/docker/pip/SQL classes, including
@@ -154,7 +154,7 @@ then scored with the real `assess()`. It reports:
 
 Run it: `python -m blast_scope.eval`.
 
-**Current calibration:** 35/35 exact, 35/35 within-one-band, gate F1 1.00.
+**Current calibration:** 38/38 exact, 38/38 within-one-band, gate F1 1.00.
 `tests/test_eval.py` pins these with headroom (exact ≥ 0.85, within ≥ 0.95,
 F1 ≥ 0.9, and no critical-labeled command ever scored `proceed`) so future
 tuning can't silently regress.
@@ -168,9 +168,13 @@ each with safe commands and (for scenario-A injection tasks) a harmful one. It
 materializes each workspace, git-inits it, and scores every command through the
 real `assess()` **without executing any** (see `bench/README.md`).
 
+All figures below are the default (hook) configuration with no dependency graph
+built; with the graph (`--index`, the MCP-tool path) `data_destruction` recall
+rises to **82.4%** (14/17) at a 0.5% FPR.
+
 | metric | value | notes |
 |---|---|---|
-| benign false-positive rate | **0.5%** (9/1725) | safe commands wrongly flagged; the survivors are mostly definitional |
+| benign false-positive rate | **0.4%** (7/1725) | safe commands wrongly flagged; the survivors are mostly definitional |
 | recall · `data_destruction` | **76.5%** (13/17) | core competency, on realistic DBs |
 | recall · `fs_destruction`   | **53.8%** (7/13) | after `repo_history`; tracked-source deletions need the graph |
 | recall · out-of-scope classes | ~0% | exfiltration / persistence / priv-esc are a different threat model |
