@@ -39,11 +39,19 @@ From `recoverability.py` (`classify_path`). After the raw score, a category
 | `tracked_clean` | 0.2              | —               | recoverable from git |
 | `tracked_dirty` | 0.55             | —               | uncommitted changes would be lost |
 | `untracked`     | 0.7              | floor ≥ 0.20    | not in history ⇒ unrecoverable |
+| `repo_history`  | 0.9              | floor ≥ 0.70    | deleting `.git`/the repo root removes the recovery net itself |
 | `precious_data` | 0.85             | floor ≥ 0.60    | *.tfstate / *.db / *.dump |
 | `gitignored`    | 0.85             | floor ≥ 0.60    | not in history |
 | `secret`        | 0.9              | floor ≥ 0.85    | .env / *.pem / id_rsa — sensitive + unrecoverable |
 
-Caps/floors apply only to state-changing commands (not pure reads).
+**Caps vs. floors gate differently.** *Caps* (`absent`/`regenerable`, which only ever
+*lower* the score) apply to any state-changing command. *Floors* (the "losing
+this is catastrophic" rows) apply only when the command's intent is
+**destructive** — not merely non-read. A command that *names* a sensitive file
+but only reads or copies it (`sqlite3 app.db '.tables'`, `hexdump key.pem`,
+`cp config.toml dest`) must not inherit a deletion's blast radius; gating these
+floors on `weight > 0` alone was the dominant false-positive source on the SABER
+corpus (see [calibration](#calibration)).
 
 ## Out-of-graph consequences
 
@@ -128,13 +136,13 @@ block or delay a command on failure.
 
 ## Calibration
 
-`eval.py` runs the labeled corpus (`tests/fixtures/eval_corpus.jsonl`, 33 cases:
-14 low / 4 medium / 9 high / 5 critical, spanning every recoverability category,
-git clean-vs-dirty state, infra/config files, a graph-indexed central module, and
-the git/docker/pip/SQL classes — including degrade-to-estimate paths). Each case
-is materialized in a throwaway project — including git working-tree state and,
-when needed, a built dependency graph — then scored with the real `assess()`. It
-reports:
+`eval.py` runs the labeled corpus (`tests/fixtures/eval_corpus.jsonl`, 35 cases
+spanning every recoverability category — including `repo_history` (`rm -rf .git`)
+and a tracked-file control — git clean-vs-dirty state, infra/config files, a
+graph-indexed central module, and the git/docker/pip/SQL classes, including
+degrade-to-estimate paths). Each case is materialized in a throwaway project —
+including git working-tree state and, when needed, a built dependency graph —
+then scored with the real `assess()`. It reports:
 
 - **exact severity** and **within-one-band** accuracy
 - **gate** precision/recall/F1 (proceed vs. flag, truth = not-low)
@@ -142,10 +150,33 @@ reports:
 
 Run it: `python -m blast_scope.eval`.
 
-**Current calibration:** 33/33 exact, 33/33 within-one-band, gate F1 1.00.
+**Current calibration:** 35/35 exact, 35/35 within-one-band, gate F1 1.00.
 `tests/test_eval.py` pins these with headroom (exact ≥ 0.85, within ≥ 0.95,
 F1 ≥ 0.9, and no critical-labeled command ever scored `proceed`) so future
 tuning can't silently regress.
+
+### Large-corpus calibration (SABER)
+
+The in-repo corpus is small and hand-built, so it can't measure a false-positive
+rate or surface over-flagging at scale. `bench/saber_eval.py` calibrates against
+[SABER](https://github.com/sssr-lab/saber) — 716 real coding-agent workspaces,
+each with safe commands and (for scenario-A injection tasks) a harmful one. It
+materializes each workspace, git-inits it, and scores every command through the
+real `assess()` **without executing any** (see `bench/README.md`).
+
+| metric | value | notes |
+|---|---|---|
+| benign false-positive rate | **0.5%** (9/1725) | safe commands wrongly flagged; the survivors are mostly definitional |
+| recall · `data_destruction` | **70.6%** (12/17) | core competency, on realistic DBs |
+| recall · `fs_destruction`   | **53.8%** (7/13) | after `repo_history` + glob/`find` work remaining |
+| recall · out-of-scope classes | ~0% | exfiltration / persistence / priv-esc are a different threat model |
+
+SABER drove three scorer changes documented above: destructive-intent gating of
+the recoverability and path-tied floors (the dominant FP source — `sqlite3 db
+'.tables'`, `hexdump key.pem`, `cp config.toml` no longer over-flag), and the
+`repo_history` category (`rm -rf .git` / the repo root). Low recall on
+exfiltration/persistence/priv-esc is expected: blast-scope scores destructive
+*consequence*, not malicious *intent* — that boundary is a deliberate design line.
 
 Three calibration fixes came out of the first runs, all in `risk_scorer.py`:
 

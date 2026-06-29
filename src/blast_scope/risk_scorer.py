@@ -232,6 +232,9 @@ def score_risk(
             score = min(score, 0.15)
         elif destroys and cat == "secret":
             score = max(score, 0.85)
+        elif destroys and cat == "repo_history":
+            # Deleting .git / the repo root takes down the recovery net itself.
+            score = max(score, 0.7)
         elif destroys and cat in ("precious_data", "gitignored"):
             score = max(score, 0.6)
         elif destroys and cat == "untracked":

@@ -195,6 +195,14 @@ def classify_path(path: Path) -> Recoverability:
     if _is_regenerable(path):
         return _r("regenerable", 0.05, True, "regenerable build/dependency artifact")
 
+    # Deleting the .git directory — or a directory that contains it (the repo
+    # root) — destroys the history that makes *everything inside* recoverable.
+    # Without this, `rm -rf project/` reads as `tracked_clean` (recoverable) when
+    # it actually takes the repo's own recovery net down with it.
+    if path.is_dir() and (path.name == ".git" or (path / ".git").exists()):
+        return _r("repo_history", 0.9, False,
+                  "removes the .git history that makes everything inside recoverable")
+
     cat, irr, rev, reason = _git_classify(path)
 
     # Secrets / irreplaceable data raise the floor regardless of git state.

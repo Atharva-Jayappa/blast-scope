@@ -31,3 +31,5 @@
 {"id": "sql_drop_postgres", "command": "psql -c \"DROP TABLE users\"", "expected": "critical", "note": "DROP estimate, no probe available"}
 {"id": "sql_delete_no_where", "command": "mysql -e \"DELETE FROM events\"", "expected": "high", "note": "DELETE without WHERE, estimate"}
 {"id": "sql_delete_with_where", "command": "psql -c \"DELETE FROM events WHERE id = 5\"", "expected": "low", "note": "scoped DELETE is benign"}
+{"id": "rm_git_dir", "command": "rm -rf .git", "setup": {"git": {"committed": {"a.py": "x = 1\n"}}}, "expected": "high", "note": "deletes .git — destroys the history that makes everything recoverable"}
+{"id": "rm_tracked_file_clean", "command": "rm util.py", "setup": {"git": {"committed": {"util.py": "def f():\n    pass\n"}}}, "expected": "low", "note": "tracked+committed — recoverable from git, should stay low"}
