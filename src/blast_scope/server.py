@@ -129,7 +129,8 @@ def assess(
     # Recoverability axis: per command, classify each target and keep the
     # worst (least recoverable) — that's what gates the safety of the step.
     recoverability_per_command = [
-        _worst_recoverability(parsed["targets"]) for parsed in parsed_list
+        _worst_recoverability(parsed.get("write_targets") or parsed["targets"])
+        for parsed in parsed_list
     ]
 
     # Out-of-graph consequences (VCS history, infra/deploy, config-by-path)

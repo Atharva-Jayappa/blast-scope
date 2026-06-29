@@ -40,6 +40,7 @@ class ParsedCommand(TypedDict):
 
     command: str
     targets: list[str]
+    write_targets: list[str]  # subset of targets actually overwritten/destroyed
     flags: list[str]
     intent: str  # "destructive" | "additive" | "read" | "unknown"
     recursive: bool
@@ -167,6 +168,18 @@ def parse_command(
     )
     intent = effect.intent
 
+    # Targets actually destroyed/overwritten — drives the recoverability floor.
+    # Normally every target; but a command made destructive ONLY by a truncating
+    # redirect (`sqlite3 db.precious '.dump' > out.sql`) overwrites the *redirect*
+    # target — its operands are read, and must not inherit a deletion's floor.
+    write_targets = targets
+    if clobber and intent == "destructive":
+        base = classify_effect(
+            base_command, flags, positional, has_subshell=has_subshell, clobber=False
+        )
+        if base.intent != "destructive":
+            write_targets = _resolve_targets(redirect_targets, cwd)
+
     # Check for recursive flags
     recursive = _check_recursive(flags)
 
@@ -176,6 +189,7 @@ def parse_command(
     return ParsedCommand(
         command=base_command,
         targets=targets,
+        write_targets=write_targets,
         flags=flags,
         intent=intent,
         recursive=recursive,
@@ -350,6 +364,7 @@ def _empty_result() -> ParsedCommand:
     return ParsedCommand(
         command="",
         targets=[],
+        write_targets=[],
         flags=[],
         intent="unknown",
         recursive=False,

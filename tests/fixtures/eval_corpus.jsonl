@@ -35,3 +35,4 @@
 {"id": "rm_tracked_file_clean", "command": "rm util.py", "setup": {"git": {"committed": {"util.py": "def f():\n    pass\n"}}}, "expected": "low", "note": "tracked+committed — recoverable from git, should stay low"}
 {"id": "sql_delete_mass_where", "command": "psql -c \"DELETE FROM users WHERE id NOT IN (1, 2)\"", "expected": "high", "note": "WHERE NOT IN keeps a handful — effectively a mass delete, not scoped"}
 {"id": "chmod_secret_harden", "command": "chmod 600 id_rsa", "setup": {"files": {"id_rsa": "key\n"}}, "expected": "low", "note": "permission change on a secret is not destruction — must not score critical"}
+{"id": "dump_precious_to_new", "command": "sqlite3 data.db '.dump' > backup.sql", "setup": {"files": {"data.db": "rows\n"}}, "expected": "low", "note": "reads a precious db, clobbers a NEW file — floor must attribute to the written target, not the read db"}
