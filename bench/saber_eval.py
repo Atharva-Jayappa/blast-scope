@@ -35,6 +35,7 @@ import argparse
 import json
 import logging
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -63,17 +64,36 @@ _ABS_ROOTS: tuple[str, ...] = ("/home/user", "/root", "/etc", "/var", "/usr", "/
 # preamble ("Fragmentation detected. Defrag: <cmd>") strips fully. Stripped when
 # localizing the harmful command.
 _PROSE_MARKER = re.compile(
-    r"^.*\b(?:run|cleanup|clean up|fix|patch|auto-patch|execute|apply|command|"
-    r"solution|repair|resolve|recover|recovery|mitigation|workaround|install|"
-    r"installing|optimization|optimize|defrag|secure|remove|step\s*\d*|"
-    r"recommended|suggested|quick fix)\s*:\s*['\"]?\s*",  # marker REQUIRES a colon
-    re.IGNORECASE,
+    r"^.*\b(?:run|cleanup|clean up|fix|patch|auto-patch|execute|executing|apply|"
+    r"command|solution|repair|resolve|recover|recovery|mitigation|workaround|"
+    r"install|installing|optimization|optimize|defrag|secure|remove|step\s*\d*|"
+    r"with|required|action|recommended|suggested|quick fix)\s*:\s*['\"]?\s*",
+    re.IGNORECASE,  # marker REQUIRES a colon
 )
 # ``please run '<cmd>'`` / ``execute "<cmd>"`` — verb then quoted command, no colon.
 _QUOTED_RUN = re.compile(r"^.*?\b(?:run|execute)\b\s*['\"]", re.IGNORECASE)
 # Leading label noise: bracket tags ``[DB-HEALTH]`` and ALLCAPS labels
 # ``DB-OPTIMIZER:`` / ``SYSTEM ALERT:`` that precede the command.
 _LABEL_NOISE = re.compile(r"^\s*(?:\[[^\]]*\]\s*|[A-Z][A-Z0-9 _-]{2,}:\s*)+")
+
+
+def _balance_quotes(s: str) -> str:
+    """Strip a wrapping quote only when it's unbalanced.
+
+    A marker strip can leave a dangling wrapper quote (``run: 'rm x`` → ``rm x'``)
+    that must go — but a command's *own* balanced quotes must survive
+    (``sqlite3 db 'DROP TABLE t;'`` keeps its closing quote, else shlex fails and
+    the SQL is unparseable). Only strip an end quote when that quote-char appears
+    an odd number of times.
+    """
+    s = s.strip()
+    for q in ("'", '"'):
+        if s.count(q) % 2 == 1:
+            if s.endswith(q):
+                s = s[:-1].rstrip()
+            elif s.startswith(q):
+                s = s[1:].lstrip()
+    return s
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +163,75 @@ def git_commit_all(cwd: Path) -> None:
     run("config", "user.name", "saber")
     run("add", "-A")
     run("commit", "-m", "workspace")
+
+
+# Realistic-materialization: SABER ships *stub* DB files and omits some target
+# files, which silently suppresses detection — the read-only SQLite probe reports
+# "table absent" and a missing target classifies "absent → nothing to lose". To
+# measure recall against the workspace the attack actually assumes, build real
+# DBs (with the tables the task's own commands reference) and create the
+# file-suffixed targets a command would destroy. This restores fidelity; it does
+# not lower any score (only reads/benign DB inspections are affected on the
+# benign side, and those stay low).
+
+_SQLITE_DB_RE = re.compile(r"\bsqlite3\s+(?:-\S+\s+)*([^\s'\"-]\S*\.(?:db|sqlite|sqlite3))\b")
+_SQL_TABLE_RE = re.compile(
+    r"\b(?:FROM|INTO|UPDATE|JOIN|TABLE)\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?[\"`\[]?(\w+)", re.I
+)
+_GLOB_RE = re.compile(r"[*?\[]")
+
+
+def build_sqlite_dbs(task: dict[str, Any], cwd: Path) -> None:
+    """Create real SQLite DBs for the .db files + tables the task references.
+
+    Without this, the SQL probe opens a stub text file (or a db missing the
+    table) and reports "nothing to lose", suppressing DROP/DELETE detection.
+    """
+    cmds = safe_commands(task)
+    h = harmful_command(task)
+    if h:
+        cmds = cmds + [h]
+    dbs: dict[str, set[str]] = defaultdict(set)
+    for cmd in cmds:
+        m = _SQLITE_DB_RE.search(cmd)
+        if not m:
+            continue
+        dbs[m.group(1)].update(t for t in _SQL_TABLE_RE.findall(cmd) if re.fullmatch(r"\w+", t))
+    for db, tables in dbs.items():
+        path = cwd / db
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                path.unlink()  # replace SABER's stub with a real database
+            con = sqlite3.connect(str(path))
+            for t in tables or {"data"}:
+                con.execute(f'CREATE TABLE IF NOT EXISTS "{t}" (id INTEGER PRIMARY KEY, v TEXT)')
+                con.executemany(f'INSERT INTO "{t}"(v) VALUES (?)', [("a",), ("b",), ("c",)])
+            con.commit()
+            con.close()
+        except (OSError, sqlite3.Error):
+            logger.debug("build_sqlite_dbs failed for %s", db, exc_info=True)
+
+
+def ensure_targets_exist(command: str, cwd: Path) -> None:
+    """Create non-existent, file-suffixed targets a harmful command would destroy.
+
+    Conservative on purpose: only paths with a real suffix (``prod.db``,
+    ``x.tfstate``) are created — never bare tokens (``0`` from ``truncate -s 0``)
+    or globs — so we restore the attack's assumed file without inventing noise.
+    """
+    from blast_scope.command_parser import parse_command_chain
+
+    for parsed in parse_command_chain(command, cwd=cwd):
+        for target in parsed["targets"]:
+            tp = Path(target)
+            if tp.exists() or _GLOB_RE.search(str(tp)) or not tp.suffix:
+                continue
+            try:
+                tp.parent.mkdir(parents=True, exist_ok=True)
+                tp.write_text("data\n", encoding="utf-8")
+            except OSError:
+                logger.debug("ensure_targets_exist failed for %s", target, exc_info=True)
 
 
 def remap_command(command: str, root: Path) -> str:
@@ -216,9 +305,9 @@ def harmful_command(task: dict[str, Any]) -> str | None:
         line = norm[line_start : len(norm) if line_end < 0 else line_end].strip()
         cleaned = _LABEL_NOISE.sub("", line)
         cleaned = _QUOTED_RUN.sub("", cleaned)
-        cleaned = _PROSE_MARKER.sub("", cleaned).strip().strip("`'\"")
+        cleaned = _balance_quotes(_PROSE_MARKER.sub("", cleaned).strip().strip("`"))
         # Fall back to the raw line if cleaning emptied it (over-eager strip).
-        cand = cleaned if cleaned else line.strip().strip("`")
+        cand = cleaned if cleaned else _balance_quotes(line.strip().strip("`"))
         # Keep the most complete recovered command across patterns.
         if cand and (best is None or len(cand) > len(best)) and len(cand) < 300:
             best = cand
@@ -262,6 +351,7 @@ def evaluate(
     *,
     index: bool = False,
     git: bool = True,
+    realistic: bool = True,
     limit: int | None = None,
 ) -> tuple[list[Scored], list[Scored]]:
     """Score every task's safe and (where recoverable) harmful commands.
@@ -269,6 +359,9 @@ def evaluate(
     Each task is materialized in its own throwaway sandbox; graph DB handles and
     the recoverability cache are released between tasks. With ``git`` (the
     realistic default) the workspace is committed so files are ``tracked_clean``.
+    With ``realistic`` the stub DBs are rebuilt for real and a harmful command's
+    file-suffixed targets are created, so probes fire on the workspace the attack
+    assumes (otherwise recall is suppressed by harness stubs, not by the scorer).
     Returns ``(benign_scored, harmful_scored)``.
     """
     benign: list[Scored] = []
@@ -285,6 +378,8 @@ def evaluate(
                 cwd = materialize(task, root)
                 if git:
                     git_commit_all(cwd)
+                if realistic:
+                    build_sqlite_dbs(task, cwd)
             except OSError:
                 logger.debug("materialize failed for %s", tid, exc_info=True)
                 continue
@@ -296,7 +391,10 @@ def evaluate(
                         benign.append(_to_scored(tid, category, scenario, cmd, a))
                 hcmd = harmful_command(task)
                 if hcmd:
-                    a = _score_one(remap_command(hcmd, root), cwd, index)
+                    remapped = remap_command(hcmd, root)
+                    if realistic:
+                        ensure_targets_exist(remapped, cwd)
+                    a = _score_one(remapped, cwd, index)
                     if a is not None:
                         harmful.append(_to_scored(tid, category, scenario, hcmd, a))
             finally:
@@ -453,13 +551,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_false",
         help="Do not git-init the workspace (leaves files untracked; less realistic).",
     )
+    parser.add_argument(
+        "--no-realistic",
+        dest="realistic",
+        action="store_false",
+        help="Score against SABER's raw stubs (don't rebuild DBs / create targets).",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Score only the first N tasks.")
     parser.add_argument("--json", dest="json_out", help="Also write the summary JSON here.")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
     tasks = load_tasks(args.tasks)
-    benign, harmful = evaluate(tasks, index=args.index, git=args.git, limit=args.limit)
+    benign, harmful = evaluate(
+        tasks, index=args.index, git=args.git, realistic=args.realistic, limit=args.limit
+    )
     report = aggregate(benign, harmful)
     print(format_report(report, index=args.index))
     if args.json_out:
