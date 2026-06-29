@@ -169,3 +169,35 @@ class TestList:
         ids = [s["id"] for s in listed]
         assert set(ids) == {first["id"], second["id"]}
         assert ids == sorted(ids, reverse=True)
+
+
+class TestRestoreSecurity:
+    """The manifest/archive under .blast-scope/ are untrusted on restore."""
+
+    def test_refuses_to_restore_outside_root(self, tmp_path: Path) -> None:
+        import json
+
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        f = proj / "config.yaml"
+        f.write_text("key: val\n")
+        manifest = snapshot.create_snapshot([f], root=proj, reason="rm config.yaml")
+        assert manifest is not None
+
+        # Poison the on-disk manifest to aim a restore at a sibling outside root.
+        outside = tmp_path / "outside" / "PWNED.txt"
+        mpath = snapshot.snapshots_dir(proj) / manifest["id"] / "manifest.json"
+        data = json.loads(mpath.read_text())
+        data["entries"][0]["original"] = str(outside)
+        mpath.write_text(json.dumps(data))
+
+        restored = snapshot.restore_snapshot(manifest["id"], root=proj)
+
+        assert restored == []  # nothing restored — destination escaped root
+        assert not outside.exists()  # and nothing was written outside the root
+
+    def test_within_helper(self, tmp_path: Path) -> None:
+        inside = tmp_path / "a" / "b.txt"
+        assert snapshot._within(inside, tmp_path)
+        assert snapshot._within(tmp_path, tmp_path)
+        assert not snapshot._within(tmp_path.parent / "elsewhere.txt", tmp_path)

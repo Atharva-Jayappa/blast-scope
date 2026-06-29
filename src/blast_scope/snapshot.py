@@ -248,17 +248,27 @@ def restore_snapshot(snapshot_id: str, *, root: Path | str) -> list[str]:
 
     manifest: Snapshot = json.loads(manifest_path.read_text(encoding="utf-8"))
     restored: list[str] = []
+    # The manifest and archive are ordinary files under .blast-scope/ — not
+    # integrity-protected. Treat both as untrusted on restore: never write a
+    # destination outside ``root`` (a poisoned manifest could otherwise overwrite
+    # ~/.ssh/authorized_keys), and never let a tar member escape the staging dir.
+    root_resolved = Path(root).resolve()
 
     with tempfile.TemporaryDirectory() as tmp:
         with tarfile.open(archive_path, "r:gz") as tar:
-            try:
-                tar.extractall(tmp, filter="data")  # py3.12+/backports: safe extraction
-            except TypeError:
-                tar.extractall(tmp)  # older 3.11.x without the filter kwarg
+            _safe_extractall(tar, Path(tmp))
 
         for entry in manifest["entries"]:
             original = Path(entry["original"])
+            if not _within(original, root_resolved):
+                logger.warning(
+                    "refusing to restore %s outside snapshot root %s", original, root_resolved
+                )
+                continue
             staged = Path(tmp) / entry["member"]
+            if not _within(staged, Path(tmp).resolve()) or not staged.exists():
+                logger.warning("skipping snapshot member %s", entry.get("member"))
+                continue
             original.parent.mkdir(parents=True, exist_ok=True)
             _remove(original)
             shutil.move(str(staged), str(original))
@@ -266,6 +276,40 @@ def restore_snapshot(snapshot_id: str, *, root: Path | str) -> list[str]:
 
     logger.info("snapshot %s restored %d path(s)", snapshot_id, len(restored))
     return restored
+
+
+def _within(child: Path, root: Path) -> bool:
+    """True if ``child`` resolves to ``root`` itself or a path inside it."""
+    try:
+        Path(child).resolve().relative_to(Path(root).resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _safe_extractall(tar: tarfile.TarFile, dest: Path) -> None:
+    """Extract a tar safely, even on Python 3.11.0-3.11.3 (no ``filter=`` kwarg).
+
+    Prefers the stdlib ``data`` filter (3.12+/3.11.4+). On older 3.11 it falls
+    back to a manual guard instead of a bare ``extractall``: reject any member
+    that is a link or whose path would escape ``dest`` (tar-slip), then extract
+    only the vetted members.
+    """
+    dest_resolved = dest.resolve()
+    try:
+        tar.extractall(dest, filter="data")
+        return
+    except TypeError:
+        pass  # interpreter predates the filter kwarg — validate by hand
+    safe = []
+    for member in tar.getmembers():
+        if member.islnk() or member.issym():
+            raise ValueError(f"refusing link member in snapshot archive: {member.name!r}")
+        target = (dest_resolved / member.name).resolve()
+        if target != dest_resolved and dest_resolved not in target.parents:
+            raise ValueError(f"refusing tar member outside extraction dir: {member.name!r}")
+        safe.append(member)
+    tar.extractall(dest, members=safe)
 
 
 def _exceeds_cap(path: Path, cap: int) -> bool:

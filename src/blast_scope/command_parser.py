@@ -64,6 +64,12 @@ _REDIRECT_PATTERN: re.Pattern[str] = re.compile(r"(\d*)(>>?)")
 # Chain operators in priority order (longer matches first)
 _CHAIN_OPERATORS: tuple[str, ...] = ("&&", "||", ";", "|")
 
+# Hard cap on how many chain segments are parsed. Each path-bearing segment can
+# fork a git subprocess (reversibility check), so an adversarial command with
+# tens of thousands of segments would otherwise stall the advisory hook for
+# minutes. Real commands chain a handful; 256 is far past any genuine use.
+MAX_CHAIN_SEGMENTS: int = 256
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -334,7 +340,7 @@ def parse_command_chain(
     if cwd is None:
         cwd = Path.cwd()
 
-    segments = split_command_chain(raw)
+    segments = split_command_chain(raw)[:MAX_CHAIN_SEGMENTS]
     if not segments:
         return []
 

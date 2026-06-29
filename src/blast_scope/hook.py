@@ -109,10 +109,15 @@ def run(payload: dict) -> dict:
     }
 
 
+# Cap stdin so a huge payload can't make the per-command hook allocate without
+# bound. A real PreToolUse payload is a few KB; 8 MiB is generous headroom.
+_MAX_STDIN_BYTES: int = 8 * 1024 * 1024
+
+
 def main() -> None:
     """Entry point: read PreToolUse JSON on stdin, emit hook output on stdout."""
     try:
-        payload = json.load(sys.stdin)
+        payload = json.loads(sys.stdin.read(_MAX_STDIN_BYTES))
     except (json.JSONDecodeError, ValueError):
         sys.exit(0)  # malformed input — stay out of the way
     out = run(payload)

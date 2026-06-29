@@ -16,6 +16,7 @@ from mcp.server.fastmcp import FastMCP
 from blast_scope import consequences as consequence_engine
 from blast_scope import snapshot as snapshot_engine
 from blast_scope.command_parser import (
+    MAX_CHAIN_SEGMENTS,
     parse_command_chain,
     split_command_chain,
 )
@@ -113,7 +114,9 @@ def assess(
         'critical'
     """
     working_dir = Path(cwd) if cwd else Path.cwd()
-    segments = split_command_chain(command)
+    # Cap segments to bound work on an adversarial mega-chain (mirrors the cap
+    # inside parse_command_chain so the two stay aligned).
+    segments = split_command_chain(command)[:MAX_CHAIN_SEGMENTS]
     parsed_list = parse_command_chain(command, cwd=working_dir)
 
     resolutions_per_command: list = []
