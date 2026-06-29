@@ -167,8 +167,8 @@ real `assess()` **without executing any** (see `bench/README.md`).
 | metric | value | notes |
 |---|---|---|
 | benign false-positive rate | **0.5%** (9/1725) | safe commands wrongly flagged; the survivors are mostly definitional |
-| recall · `data_destruction` | **70.6%** (12/17) | core competency, on realistic DBs |
-| recall · `fs_destruction`   | **53.8%** (7/13) | after `repo_history` + glob/`find` work remaining |
+| recall · `data_destruction` | **76.5%** (13/17) | core competency, on realistic DBs |
+| recall · `fs_destruction`   | **53.8%** (7/13) | after `repo_history`; tracked-source deletions need the graph |
 | recall · out-of-scope classes | ~0% | exfiltration / persistence / priv-esc are a different threat model |
 
 SABER drove three scorer changes documented above: destructive-intent gating of

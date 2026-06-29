@@ -6,6 +6,8 @@ module with side effects — all scoring logic is delegated to pure functions.
 
 from __future__ import annotations
 
+import glob
+import itertools
 import logging
 from pathlib import Path
 
@@ -173,7 +175,7 @@ def reset_resolvers() -> None:
 
 
 def _worst_recoverability(targets: list[str]) -> Recoverability | None:
-    """Classify each target and return the least-recoverable one.
+    """Classify each target (expanding globs) and return the least-recoverable.
 
     Returns ``None`` when a command has no resolved targets, so the scorer
     falls back to the parser's coarse reversibility flag.
@@ -185,10 +187,29 @@ def _worst_recoverability(targets: list[str]) -> Recoverability | None:
     """
     worst: Recoverability | None = None
     for target in targets:
-        rec = classify_path(Path(target))
-        if worst is None or rec["irrecoverability"] > worst["irrecoverability"]:
-            worst = rec
+        for path in _expand_globs(target):
+            rec = classify_path(path)
+            if worst is None or rec["irrecoverability"] > worst["irrecoverability"]:
+                worst = rec
     return worst
+
+
+def _expand_globs(target: str) -> list[Path]:
+    """Expand a glob target to its real matches; else the literal path.
+
+    ``rm src/*.py`` resolves to the files it would delete so their
+    recoverability is scored — otherwise the literal ``*.py`` looks ``absent``
+    and the deletion scores low. An unmatched glob stays literal (still
+    ``absent``, as before), so this only ever sharpens, never hides.
+    """
+    if any(ch in target for ch in "*?["):
+        # Cap the walk: a recursive glob (`/**/*.py`) must not turn a cheap
+        # advisory into a filesystem-wide scan. The worst-recoverability among
+        # the first matches is representative enough for scoring.
+        matches = list(itertools.islice(glob.iglob(target, recursive=True), 1000))
+        if matches:
+            return [Path(m) for m in matches]
+    return [Path(target)]
 
 
 @mcp.tool()

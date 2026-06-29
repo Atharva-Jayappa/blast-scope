@@ -225,7 +225,12 @@ def score_risk(
         # on `weight > 0` alone made these the dominant false-positive source on
         # the SABER corpus. CAPS only ever *lower* the score, so they stay
         # ungated by intent (a read of node_modules is cheap regardless).
-        destroys = parsed["intent"] == "destructive"
+        # chmod/chown change *metadata*, not content — `chmod 600 id_rsa` hardens
+        # a key, it doesn't destroy it — so they don't inherit a content floor.
+        destroys = (
+            parsed["intent"] == "destructive"
+            and parsed["command"] not in ("chmod", "chown")
+        )
         if cat == "absent":
             score = min(score, 0.1)
         elif cat == "regenerable":

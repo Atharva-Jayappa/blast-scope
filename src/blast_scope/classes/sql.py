@@ -43,6 +43,10 @@ _DROP_RE = re.compile(r"\bDROP\s+(TABLE|DATABASE|SCHEMA|VIEW|INDEX)\b\s+(?:IF\s+
 _TRUNCATE_RE = re.compile(r"\bTRUNCATE\s+(?:TABLE\s+)?([`\"\[]?\w+)", re.I)
 _DELETE_RE = re.compile(r"\bDELETE\s+FROM\s+([`\"\[]?\w+)", re.I)
 _WHERE_RE = re.compile(r"\bWHERE\b", re.I)
+# A WHERE that still removes (nearly) everything — a scoped DELETE this is not.
+# `WHERE rowid NOT IN (SELECT MIN(rowid) ...)` keeps one row per group; `1=1`
+# and `WHERE true` are unconditional.
+_MASS_WHERE_RE = re.compile(r"\bNOT\s+IN\b|\b1\s*=\s*1\b|\bWHERE\s+(?:true|1)\b", re.I)
 _TX_OPEN_RE = re.compile(r"\b(BEGIN|START\s+TRANSACTION)\b", re.I)
 _COMMIT_RE = re.compile(r"\bCOMMIT\b", re.I)
 
@@ -134,7 +138,9 @@ def _classify_sql(sql: str) -> str | None:
         return "drop"
     if _TRUNCATE_RE.search(sql):
         return "truncate"
-    if _DELETE_RE.search(sql) and not _WHERE_RE.search(sql):
+    if _DELETE_RE.search(sql) and (
+        not _WHERE_RE.search(sql) or _MASS_WHERE_RE.search(sql)
+    ):
         return "delete_all"
     return None
 
