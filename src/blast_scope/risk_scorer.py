@@ -200,9 +200,12 @@ def score_risk(
     # Path-tied consequences (infra/deploy reach, config files loaded by path)
     # raise the score to their floor. Applied BEFORE the recoverability caps
     # below so a regenerable/absent target — node_modules, a path that doesn't
-    # exist — still caps low even if something references it. Gated on intent so
-    # a read (`cat config.yaml`) isn't raised.
-    if consequences and parsed["intent"] != "read":
+    # exist — still caps low even if something references it. Gated on
+    # *destructive* intent: the floor expresses "destroying/overwriting this
+    # config or infra file breaks things the graph can't see", so a read or a
+    # plain copy (`hexdump config.json`, `cp config.toml dest`) that merely names
+    # the file must not inherit it — that was a false-positive source on SABER.
+    if consequences and parsed["intent"] == "destructive":
         path_floor = max(
             (c.floor for c in consequences if c.domain not in _STATE_TIED_DOMAINS),
             default=0.0,
@@ -214,15 +217,24 @@ def score_risk(
     # Only applied to commands that actually change state (weight > 0).
     if recoverability is not None and weight > 0.0:
         cat = recoverability["category"]
+        # FLOORS ("losing this is catastrophic") answer *how bad if the target is
+        # destroyed* — so they apply only to a genuinely destructive op. An
+        # `unknown`-intent command that merely *names* a sensitive file
+        # (`sqlite3 app.db '.tables'`, `hexdump key.pem`, `python3 run.py`) reads
+        # or executes it; it must not inherit a deletion's blast radius. Gating
+        # on `weight > 0` alone made these the dominant false-positive source on
+        # the SABER corpus. CAPS only ever *lower* the score, so they stay
+        # ungated by intent (a read of node_modules is cheap regardless).
+        destroys = parsed["intent"] == "destructive"
         if cat == "absent":
             score = min(score, 0.1)
         elif cat == "regenerable":
             score = min(score, 0.15)
-        elif cat == "secret":
+        elif destroys and cat == "secret":
             score = max(score, 0.85)
-        elif cat in ("precious_data", "gitignored"):
+        elif destroys and cat in ("precious_data", "gitignored"):
             score = max(score, 0.6)
-        elif cat == "untracked":
+        elif destroys and cat == "untracked":
             # Not in git history → unrecoverable once destroyed. Even an
             # unknown file is at least a medium concern when it's gone for good.
             score = max(score, 0.2)
