@@ -1,6 +1,6 @@
 # Blast Scope
 
-<!-- mcp-name: io.github.atharva-jayappa/blast-scope -->
+<!-- mcp-name: io.github.Atharva-Jayappa/blast-scope -->
 
 **A consequence engine for shell commands.** Blast Scope scores what a command
 would actually *do* — before an AI agent (or you) runs it. It doesn't pattern-match
@@ -101,7 +101,7 @@ declares is asserted read-only by the test suite, so no probe can ever mutate.
 
 ## Status
 
-**v0.3.0 — calibrated multi-class guardrail with a precise dependency graph.**
+**v0.3.1 — calibrated multi-class guardrail with a precise dependency graph.**
 
 | Capability | Module |
 |---|---|
