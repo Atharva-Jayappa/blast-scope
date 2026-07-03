@@ -8,7 +8,7 @@ a set of ``expected_safe_commands`` and either a literal harmful command (in the
 
 That maps cleanly onto blast-scope's ``assess()`` — score a single command
 against a real workspace state — so SABER gives two honest, large-sample views
-the in-repo 33-case corpus cannot:
+the in-repo 38-case corpus cannot:
 
 - **benign false-positive rate** — across *every* task's ``expected_safe_commands``
   (~1725 real safe commands in real project states). The number blast-scope most

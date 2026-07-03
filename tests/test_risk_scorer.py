@@ -5,7 +5,9 @@ from __future__ import annotations
 import pytest
 
 from blast_scope.command_parser import ParsedCommand
+from blast_scope.consequences import Consequence
 from blast_scope.graph_resolver import GraphResolution, ResolvedNode
+from blast_scope.recoverability import Recoverability
 from blast_scope.risk_scorer import (
     RiskAssessment,
     score_risk,
@@ -245,6 +247,30 @@ class TestEdgeCases:
         assert "rm" in result["rationale"]
         assert "config.py" in result["rationale"]
         assert "3 direct importer" in result["rationale"]
+
+    def test_state_tied_consequence_does_not_leak_filesystem_reason(self) -> None:
+        """git/docker/sql/packages must explain via the consequence, not a bogus path.
+
+        Regression: the parser hands state-tied commands their subcommand token
+        (`reset`) as a filesystem target, so recoverability classified it
+        "absent" and the reason "path does not exist — nothing to lose" led the
+        evidence and rationale of `git reset --hard`. The explanation must lead
+        with the git consequence, and the bogus filesystem reason must not appear.
+        """
+        parsed = _make_parsed(command="git", targets=["/project/reset"], intent="destructive")
+        rec = Recoverability(
+            category="absent",
+            irrecoverability=0.0,
+            reversible=True,
+            reason="path does not exist — nothing to lose",
+        )
+        cons = [Consequence("vcs", 0.45, "git reset --hard would discard 1 file(s)")]
+        result = score_risk(parsed, [], recoverability=rec, consequences=cons)
+
+        assert result["evidence"] == ["git reset --hard would discard 1 file(s)"]
+        assert result["rationale"].startswith("git reset --hard would discard")
+        assert not any("path does not exist" in e for e in result["evidence"])
+        assert "path does not exist" not in result["rationale"]
 
     def test_affected_nodes_aggregated(self) -> None:
         nodes = [

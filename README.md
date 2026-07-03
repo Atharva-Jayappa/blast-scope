@@ -125,9 +125,11 @@ declares is asserted read-only by the test suite, so no probe can ever mutate.
   workspaces. Against ~1725 safe commands, blast-scope's **false-positive rate is
   0.4%**; on its core competency (`data_destruction`) it catches **76.5%** of
   injected attacks on realistic workspaces (**82%** with the dependency graph
-  built). The honest per-category recall — low on out-of-scope
-  exfiltration/persistence, a different threat model — is the probe roadmap.
-  See [`bench/`](bench).
+  built). The per-category recall is deliberately uneven, and the table says so:
+  blast-scope scores *destructive consequence* — filesystem/data loss plus
+  git/docker/pip/SQL state. Network exfiltration and persistence are a **different
+  threat model, out of scope by design** — not an unfinished corner. That's the
+  boundary, drawn on purpose. See [`bench/`](bench).
 
 ```bash
 uv run python -m blast_scope.eval                 # in-repo corpus
@@ -280,7 +282,7 @@ blast-scope/
 │   ├── snapshot.py          # tarball snapshot / restore / list
 │   ├── eval.py              # evaluation harness + metrics
 │   └── vendor/crg/          # vendored from code-review-graph (MIT)
-├── tests/                   # 295+ tests incl. eval regression guard
+├── tests/                   # 298 tests incl. eval regression guard
 │   └── fixtures/eval_corpus.jsonl   # labeled calibration corpus
 └── docs/
     ├── heuristics.md        # scoring model + per-class tables + calibration

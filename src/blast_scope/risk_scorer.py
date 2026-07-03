@@ -270,11 +270,28 @@ def score_risk(
     for r in resolutions:
         affected_nodes.extend(r["affected_nodes"])
 
-    # Build rationale + evidence
-    rationale = _build_rationale(parsed, resolutions, score, severity, has_graph_data)
-    evidence = _build_evidence(parsed, resolutions, recoverability, has_graph_data, importance)
-    if consequences and parsed["intent"] != "read":
-        evidence.extend(c.evidence for c in consequences)
+    # Build rationale + evidence. For state-tied classes (git/docker/sql/
+    # packages) the operands the parser saw are subcommands/refs/table names,
+    # not filesystem paths — so the "targets" are bogus paths and the recover-
+    # ability/rationale derived from them is misleading noise ("path does not
+    # exist — nothing to lose" on `git reset --hard`). When such a consequence
+    # is present, lead the explanation with IT rather than the path model.
+    state_consequences = (
+        [c for c in consequences if c.domain in _STATE_TIED_DOMAINS]
+        if consequences
+        else []
+    )
+    if state_consequences:
+        lead = max(state_consequences, key=lambda c: c.floor)
+        rationale = f"{lead.evidence}. {severity.upper()} risk."
+        evidence = [c.evidence for c in consequences]
+    else:
+        rationale = _build_rationale(parsed, resolutions, score, severity, has_graph_data)
+        evidence = _build_evidence(
+            parsed, resolutions, recoverability, has_graph_data, importance
+        )
+        if consequences and parsed["intent"] != "read":
+            evidence.extend(c.evidence for c in consequences)
 
     return RiskAssessment(
         score=round(score, 3),
