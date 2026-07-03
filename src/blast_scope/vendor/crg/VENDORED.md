@@ -1,7 +1,8 @@
 # Vendored from code-review-graph
 
 - **Source:** https://github.com/tirth8205/code-review-graph
-- **License:** MIT
+- **License:** MIT — original notice preserved verbatim in [`LICENSE`](LICENSE)
+  (Copyright (c) 2026 Tirth Kanani), as MIT requires for substantial portions.
 - **Commit:** 87d5265 (2026-04-11)
 - **Files taken:** parser.py, graph.py, constants.py, migrations.py, tsconfig_resolver.py
 

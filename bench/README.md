@@ -25,9 +25,10 @@ flagged). That maps directly onto blast-scope's `assess()`.
   destructive *consequence* (filesystem/data destruction, git, docker, pip,
   SQL); it does **not** model supply-chain injection, exfiltration, persistence,
   or privilege escalation — those are a different threat model (malicious
-  content, not destructive consequence). High recall on `data_destruction` /
-  `fs_destruction` and low recall elsewhere is the expected, honest result, and
-  the per-category table is the roadmap for which probes to build next.
+  content, not destructive consequence), out of scope by design. High recall on
+  `data_destruction` / `fs_destruction` and low recall elsewhere is the expected,
+  honest result: the per-category table marks that boundary on purpose — it is
+  not a backlog of unfinished work.
 
 ### Get the dataset (not vendored)
 
