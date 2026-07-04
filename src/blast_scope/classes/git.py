@@ -14,7 +14,7 @@ strictly read-only probes the v0.2 model calls for:
   unmerged one carries commits (still reflog-recoverable for the gc window).
 
 Every probe here is a read-only git plumbing read (``status`` / ``reflog`` /
-``rev-parse`` / ``rev-list``) — see :meth:`GitClass.probe_commands`. When a probe
+``rev-parse`` / ``rev-list``), routed through :func:`_git_read`. When a probe
 can't run (not a repo, git missing, timeout) the class degrades to the base
 consequence and labels the refinement ``estimated``.
 """
@@ -54,9 +54,10 @@ class GitClass:
     def triage(self, raw: str, parsed: ParsedCommand) -> Candidate | None:
         """Classify a git command as a destructive operation, cheaply.
 
-        Mirrors the destructive conditions in :func:`blast_scope.vcs.analyze_git`
-        using only string/flag inspection — no repo reads — so non-destructive
-        git (and every non-git command) exits in microseconds.
+        Delegates to the canonical :func:`blast_scope.vcs.destructive_op` (the
+        same classifier the consequence floor uses) — only string/flag
+        inspection, no repo reads — so non-destructive git (and every non-git
+        command) exits in microseconds.
 
         Example::
 
@@ -68,33 +69,10 @@ class GitClass:
         if parsed.get("command") != "git":
             return None
         sub, flags = vcs._subcommand(raw)
-        if sub is None:
-            return None
-
-        op = _destructive_op(sub, flags, raw)
+        op = vcs.destructive_op(sub, flags, raw)
         if op is None:
             return None
         return Candidate(cls=self.name, operation=op, raw=raw)
-
-    # -- declared read-only probe surface (for the no-mutation test) ---------
-
-    def probe_commands(self, candidate: Candidate) -> list[list[str]]:
-        """The read-only git reads ``assess`` may run for this candidate."""
-        cmds: list[list[str]] = [
-            ["git", "reflog", "--oneline", "-n", "1"],
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        ]
-        if candidate.operation == "push_force":
-            cmds += [
-                ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-                ["git", "rev-list", "--count", "HEAD..@{u}"],
-            ]
-        elif candidate.operation == "branch_delete":
-            cmds += [
-                ["git", "rev-list", "--count", "<branch>",
-                 "--not", "--exclude=<branch>", "--branches", "--remotes"]
-            ]
-        return cmds
 
     # -- Stage 2: assess (probe + refine) -----------------------------------
 
@@ -120,36 +98,6 @@ class GitClass:
             floor, evidence, estimated = base.floor, base.evidence, False
 
         return Consequence("vcs", floor, evidence, estimated=estimated)
-
-
-# ---------------------------------------------------------------------------
-# Triage helper (pure)
-# ---------------------------------------------------------------------------
-
-
-def _destructive_op(sub: str, flags: list[str], raw: str) -> str | None:
-    """Map a git subcommand+flags to a destructive operation id, or ``None``.
-
-    Pure — matches :func:`blast_scope.vcs.analyze_git`'s gating so triage and the
-    base consequence always agree on what counts as destructive.
-    """
-    if sub == "reset" and vcs._has(flags, "--hard"):
-        return "reset_hard"
-    if sub == "clean" and vcs._has_force_clean(flags):
-        return "clean_force"
-    if sub == "push" and vcs._has(flags, "--force", "-f"):
-        return "push_force"
-    if sub in ("checkout", "restore", "switch") and (
-        sub == "restore" or vcs._has(flags, "--force", "-f") or vcs._targets_paths(raw, sub)
-    ):
-        return "discard_paths"
-    if sub == "stash" and vcs._drops_stash(raw):
-        return "stash_drop"
-    if sub in ("rebase", "filter-branch", "filter-repo"):
-        return "history_rewrite"
-    if sub == "branch" and vcs._has(flags, "-D"):
-        return "branch_delete"
-    return None
 
 
 # ---------------------------------------------------------------------------

@@ -145,29 +145,6 @@ class TestAssess:
 
 
 # ---------------------------------------------------------------------------
-# Probe surface is read-only (the structural no-mutation guarantee)
-# ---------------------------------------------------------------------------
-
-
-# git plumbing/porcelain reads that cannot mutate repository state.
-_READ_ONLY_GIT = frozenset(
-    {"status", "reflog", "rev-parse", "rev-list", "log", "show", "diff",
-     "branch", "cat-file", "ls-files", "for-each-ref", "describe"}
-)
-
-
-class TestProbeSurface:
-    @pytest.mark.parametrize(
-        "op", ["reset_hard", "push_force", "branch_delete", "clean_force"]
-    )
-    def test_probe_commands_are_read_only(self, op: str) -> None:
-        cmds = GitClass().probe_commands(Candidate("git", op, "git"))
-        for cmd in cmds:
-            assert cmd[0] == "git"
-            assert cmd[1] in _READ_ONLY_GIT, f"{cmd} is not a read-only git command"
-
-
-# ---------------------------------------------------------------------------
 # Registry integration
 # ---------------------------------------------------------------------------
 

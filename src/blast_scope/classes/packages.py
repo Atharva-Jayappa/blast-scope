@@ -49,12 +49,6 @@ class PackagesClass:
             return Candidate(self.name, "uv_uninstall", raw, operands=pkgs)
         return None
 
-    # -- probe surface: none external (pure file reads) ----------------------
-
-    def probe_commands(self, candidate: Candidate) -> list[list[str]]:
-        """No external probe — recoverability is read from manifest files."""
-        return []
-
     # -- Stage 2: assess -----------------------------------------------------
 
     def assess(self, candidate: Candidate, cwd: Path) -> Consequence | None:

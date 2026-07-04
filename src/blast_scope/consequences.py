@@ -88,14 +88,3 @@ def gather(
             out.append(config_c)
 
     return out
-
-
-def max_floor(consequences: list[Consequence]) -> float:
-    """Return the strongest floor among consequences (0.0 if none).
-
-    Example::
-
-        >>> max_floor([Consequence("vcs", 0.7, ""), Consequence("infra", 0.6, "")])
-        0.7
-    """
-    return max((c.floor for c in consequences), default=0.0)

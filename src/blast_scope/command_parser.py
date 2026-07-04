@@ -337,13 +337,28 @@ def parse_command_chain(
         >>> parse_command_chain("cd /tmp && rm -rf .", cwd=Path("/home/user"))
         [{"command": "cd", ...}, {"command": "rm", "targets": ["/tmp"], ...}]
     """
+    return parse_chain_with_segments(raw, cwd=cwd, shell=shell)[1]
+
+
+def parse_chain_with_segments(
+    raw: str, cwd: Path | None = None, shell: str = "auto"
+) -> tuple[list[str], list[ParsedCommand]]:
+    """Split a chain once and parse each segment, returning both in lockstep.
+
+    Guarantees ``len(segments) == len(parsed)`` from a *single* split, so a
+    caller that needs the raw segment text alongside the parse (the server, for
+    its per-segment consequence analysis) can't drift the two out of alignment
+    by splitting the command twice.
+
+    Example::
+
+        >>> parse_chain_with_segments("cd /tmp && rm -rf .")[0]
+        ["cd /tmp", "rm -rf ."]
+    """
     if cwd is None:
         cwd = Path.cwd()
 
     segments = split_command_chain(raw)[:MAX_CHAIN_SEGMENTS]
-    if not segments:
-        return []
-
     parsed_list: list[ParsedCommand] = []
     current_cwd = cwd
 
@@ -357,7 +372,7 @@ def parse_command_chain(
             if new_dir.is_dir():
                 current_cwd = new_dir
 
-    return parsed_list
+    return segments, parsed_list
 
 
 # ---------------------------------------------------------------------------
@@ -496,22 +511,6 @@ def _looks_like_path(arg: str) -> bool:
     if not arg.startswith("-") and not any(c in arg for c in ("=", "(", ")", "{", "}", "|", "&", ";", "*", "?")):
         return True
     return False
-
-
-def _classify_intent(command: str, has_subshell: bool) -> str:
-    """Classify the bare intent of a command (no flags/operands).
-
-    Thin wrapper over :func:`blast_scope.command_effects.classify_effect`,
-    kept for callers that only have the command name.
-
-    Example::
-
-        >>> _classify_intent("rm", False)
-        "destructive"
-        >>> _classify_intent("cat", False)
-        "read"
-    """
-    return classify_effect(canonicalize(command), [], [], has_subshell=has_subshell).intent
 
 
 def _check_recursive(flags: list[str]) -> bool:

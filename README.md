@@ -93,9 +93,9 @@ filesystem formula, and calibration.
 | **pip / uv** | `pip uninstall`, `uv pip uninstall` | read lockfile / manifest (no subprocess) | lockfile present → fully regenerable |
 | **SQL** | `DROP`, `TRUNCATE`, `DELETE` without `WHERE` | SQLite: `SELECT count(*)` `mode=ro`; transaction check | inside a transaction? backup posture? |
 
-New classes drop in behind one protocol (`triage` / `probe_commands` / `assess`)
-in [`src/blast_scope/classes/`](src/blast_scope/classes); the probe surface each
-declares is asserted read-only by the test suite, so no probe can ever mutate.
+New classes drop in behind one protocol (`triage` / `assess`)
+in [`src/blast_scope/classes/`](src/blast_scope/classes); each class confines
+`assess` to strictly side-effect-free reads.
 
 ---
 

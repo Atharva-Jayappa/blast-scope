@@ -14,9 +14,8 @@ SQL), each running two stages so the common case stays cheap:
 
 The eligibility filter is structural: a class is only allowed a live probe when
 both (a) a safe, side-effect-free read can observe the impact and (b) its
-reversibility is authorable in a static table. State-mutating probes are out of
-scope by construction — :meth:`ConsequenceClass.probe_commands` declares exactly
-what a class may run, and the test-suite asserts that surface is read-only.
+reversibility is authorable in a static table. Each class confines ``assess`` to
+strictly side-effect-free reads by construction.
 
 Adding a class = implement the protocol and list it in :func:`registry`.
 """
@@ -60,16 +59,6 @@ class ConsequenceClass(Protocol):
 
         Must be near-free (no subprocess / network). Returns a
         :class:`Candidate` for destructive matches, else ``None``.
-        """
-        ...
-
-    def probe_commands(self, candidate: Candidate) -> list[list[str]]:
-        """The exact, **read-only** operations ``assess`` may issue to probe impact.
-
-        Each entry is a token list — a shell command (``["docker", "ps", ...]``)
-        or a query (``["SELECT", "count(*) ..."]``). Declared separately so tests
-        can assert the probe surface never mutates state. A class that probes only
-        by reading files (no command/query) returns ``[]``.
         """
         ...
 

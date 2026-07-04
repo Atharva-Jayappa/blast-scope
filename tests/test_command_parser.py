@@ -11,7 +11,6 @@ from blast_scope.command_parser import (
     ParsedCommand,
     parse_command,
     _check_recursive,
-    _classify_intent,
     _looks_like_path,
     _tokenize,
 )
@@ -219,28 +218,6 @@ class TestReversibility:
     def test_no_targets_not_reversible(self) -> None:
         result = parse_command("")
         assert result["reversible"] is False
-
-
-# ---------------------------------------------------------------------------
-# Intent classification
-# ---------------------------------------------------------------------------
-
-
-class TestClassifyIntent:
-    def test_destructive(self) -> None:
-        for cmd in ("rm", "rmdir", "truncate", "dd", "mkfs", "shred"):
-            assert _classify_intent(cmd, False) == "destructive"
-
-    def test_additive(self) -> None:
-        for cmd in ("touch", "mkdir", "cp", "tee"):
-            assert _classify_intent(cmd, False) == "additive"
-
-    def test_read(self) -> None:
-        for cmd in ("cat", "head", "tail", "less", "grep", "find", "ls", "wc"):
-            assert _classify_intent(cmd, False) == "read"
-
-    def test_subshell_overrides(self) -> None:
-        assert _classify_intent("rm", True) == "unknown"
 
 
 # ---------------------------------------------------------------------------

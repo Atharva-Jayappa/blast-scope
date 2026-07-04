@@ -10,7 +10,7 @@ import pytest
 
 from blast_scope import config_refs, infra, vcs
 from blast_scope.command_parser import parse_command
-from blast_scope.consequences import Consequence, gather, max_floor
+from blast_scope.consequences import Consequence, gather
 from blast_scope.recoverability import Recoverability, clear_cache
 from blast_scope.risk_scorer import score_risk
 
@@ -171,18 +171,11 @@ class TestConfigRefs:
 
 
 # ---------------------------------------------------------------------------
-# consequences.gather / max_floor
+# consequences.gather
 # ---------------------------------------------------------------------------
 
 
 class TestGather:
-    def test_max_floor_empty(self) -> None:
-        assert max_floor([]) == 0.0
-
-    def test_max_floor_picks_strongest(self) -> None:
-        cs = [Consequence("vcs", 0.3, ""), Consequence("infra", 0.6, "")]
-        assert max_floor(cs) == 0.6
-
     def test_gather_infra_target(self, tmp_path: Path) -> None:
         (tmp_path / "Dockerfile").write_text("FROM scratch\n")
         parsed = parse_command("rm Dockerfile", cwd=tmp_path)

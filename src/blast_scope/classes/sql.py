@@ -72,18 +72,6 @@ class SqlClass:
             return None
         return Candidate(self.name, op, raw, operands=(engine, dbfile or ""))
 
-    # -- declared read-only probe surface ------------------------------------
-
-    def probe_commands(self, candidate: Candidate) -> list[list[str]]:
-        """The read-only queries the SQLite probe issues (others don't probe)."""
-        engine = candidate.operands[0] if candidate.operands else ""
-        if engine != "sqlite":
-            return []
-        return [
-            ["SELECT", "name FROM sqlite_master WHERE type='table' AND name=?"],
-            ["SELECT", "count(*) FROM <table>"],
-        ]
-
     # -- Stage 2: assess -----------------------------------------------------
 
     def assess(self, candidate: Candidate, cwd: Path) -> Consequence | None:

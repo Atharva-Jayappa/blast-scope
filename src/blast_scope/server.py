@@ -15,11 +15,7 @@ from mcp.server.fastmcp import FastMCP
 
 from blast_scope import consequences as consequence_engine
 from blast_scope import snapshot as snapshot_engine
-from blast_scope.command_parser import (
-    MAX_CHAIN_SEGMENTS,
-    parse_command_chain,
-    split_command_chain,
-)
+from blast_scope.command_parser import parse_chain_with_segments
 from blast_scope.graph_resolver import GraphResolver
 from blast_scope.recoverability import Recoverability, classify_path, clear_cache
 from blast_scope.risk_scorer import score_chain
@@ -114,10 +110,9 @@ def assess(
         'critical'
     """
     working_dir = Path(cwd) if cwd else Path.cwd()
-    # Cap segments to bound work on an adversarial mega-chain (mirrors the cap
-    # inside parse_command_chain so the two stay aligned).
-    segments = split_command_chain(command)[:MAX_CHAIN_SEGMENTS]
-    parsed_list = parse_command_chain(command, cwd=working_dir)
+    # One split → segments and their parses stay 1:1 aligned (and the chain cap
+    # is applied once, inside the helper).
+    segments, parsed_list = parse_chain_with_segments(command, cwd=working_dir)
 
     resolutions_per_command: list = []
     if project_root and (auto_index or _graph_exists(Path(project_root))):

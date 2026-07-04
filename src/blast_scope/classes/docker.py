@@ -9,9 +9,8 @@ Docker's destructive verbs split cleanly along reversibility:
   re-pullable (a slow rebuild, not a loss).
 
 The safe probe is the read-only daemon API (``volume inspect`` / ``ps`` /
-``volume ls`` / ``images`` — see :meth:`DockerClass.probe_commands`). When the
-docker CLI is missing or the daemon is unreachable, the class degrades to a
-heuristic floor and labels it ``estimated``.
+``volume ls`` / ``images``). When the docker CLI is missing or the daemon is
+unreachable, the class degrades to a heuristic floor and labels it ``estimated``.
 """
 
 from __future__ import annotations
@@ -50,26 +49,6 @@ class DockerClass:
             return None
         operation, operands = op
         return Candidate(cls=self.name, operation=operation, raw=raw, operands=operands)
-
-    # -- declared read-only probe surface ------------------------------------
-
-    def probe_commands(self, candidate: Candidate) -> list[list[str]]:
-        """The read-only docker reads ``assess`` may run for this candidate."""
-        cmds: list[list[str]] = [["docker", "volume", "ls", "-q"]]
-        if candidate.operation == "volume_rm":
-            cmds += [
-                ["docker", "volume", "inspect", "<vol>"],
-                ["docker", "ps", "-a", "--filter", "volume=<vol>", "--format", "{{.Names}}"],
-            ]
-        elif candidate.operation in ("system_prune", "volume_prune"):
-            cmds += [
-                ["docker", "volume", "ls", "-f", "dangling=true", "-q"],
-                ["docker", "ps", "-a", "-q"],
-                ["docker", "images", "-q"],
-            ]
-        elif candidate.operation == "container_rm":
-            cmds += [["docker", "ps", "-a", "--filter", "name=<c>", "--format", "{{.Names}}"]]
-        return cmds
 
     # -- Stage 2: assess -----------------------------------------------------
 

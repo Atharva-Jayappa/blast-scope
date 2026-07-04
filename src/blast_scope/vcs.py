@@ -46,44 +46,84 @@ def analyze_git(parsed: ParsedCommand, raw: str, cwd: Path) -> Consequence | Non
         return None
 
     sub, flags = _subcommand(raw)
-    if sub is None:
+    op = destructive_op(sub, flags, raw)
+    if op is None:
         return None
 
     counts = working_tree_state(cwd)
     modified, untracked = (counts[0], counts[1]) if counts else (0, 0)
 
-    if sub == "reset" and _has(flags, "--hard"):
+    if op == "reset_hard":
         return _from_count(
             modified,
             "git reset --hard would discard {n} file(s) with uncommitted changes",
             "git reset --hard, but the working tree is clean — nothing to lose",
         )
-    if sub == "clean" and _has_force_clean(flags):
+    if op == "clean_force":
         return _from_count(
             untracked,
             "git clean would delete {n} untracked file(s) permanently",
             "git clean, but there are no untracked files to remove",
         )
-    if sub in ("checkout", "restore", "switch") and (
-        sub == "restore" or _has(flags, "--force", "-f") or _targets_paths(raw, sub)
-    ):
+    if op == "discard_paths":
         return _from_count(
             modified,
             "discarding local changes would lose {n} modified file(s)",
             "no local modifications to discard",
         )
-    if sub == "stash" and _drops_stash(raw):
+    if op == "stash_drop":
         return Consequence("vcs", 0.5, "dropping a stash permanently removes those changes")
-    if sub == "push" and _has(flags, "--force", "-f"):
+    if op == "push_force":
         return Consequence(
             "vcs", 0.7,
             "force-push can overwrite remote history other clones depend on "
             "(prefer --force-with-lease)",
         )
-    if sub in ("rebase", "filter-branch", "filter-repo"):
+    if op == "history_rewrite":
         return Consequence("vcs", 0.6, f"git {sub} rewrites commit history")
-    if sub == "branch" and _has(flags, "-D"):
+    if op == "branch_delete":
         return Consequence("vcs", 0.4, "force-deleting a branch drops unmerged commits")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Canonical destructive-op classification (single source of truth)
+# ---------------------------------------------------------------------------
+
+
+def destructive_op(sub: str | None, flags: list[str], raw: str) -> str | None:
+    """Map a git subcommand + flags to a destructive-operation id, or ``None``.
+
+    The one place that decides *which* git invocations destroy or rewrite work.
+    Both the consequence floor (:func:`analyze_git`) and the class-based triage
+    (:class:`blast_scope.classes.git.GitClass`) route through this, so they can
+    never disagree about what counts as destructive.
+
+    Example::
+
+        >>> destructive_op("reset", ["--hard"], "git reset --hard")
+        'reset_hard'
+        >>> destructive_op("status", [], "git status") is None
+        True
+    """
+    if sub is None:
+        return None
+    if sub == "reset" and _has(flags, "--hard"):
+        return "reset_hard"
+    if sub == "clean" and _has_force_clean(flags):
+        return "clean_force"
+    if sub == "push" and _has(flags, "--force", "-f"):
+        return "push_force"
+    if sub in ("checkout", "restore", "switch") and (
+        sub == "restore" or _has(flags, "--force", "-f") or _targets_paths(raw, sub)
+    ):
+        return "discard_paths"
+    if sub == "stash" and _drops_stash(raw):
+        return "stash_drop"
+    if sub in ("rebase", "filter-branch", "filter-repo"):
+        return "history_rewrite"
+    if sub == "branch" and _has(flags, "-D"):
+        return "branch_delete"
     return None
 
 

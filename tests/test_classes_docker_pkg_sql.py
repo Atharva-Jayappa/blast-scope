@@ -128,10 +128,6 @@ class TestPackages:
         c = PackagesClass().assess(Candidate("packages", "pip_uninstall", "pip uninstall flask", ("flask",)), tmp_path)
         assert c is not None and 0.2 <= c.floor < 0.5
 
-    def test_probe_surface_is_empty(self) -> None:
-        # No subprocess at all — the structural guarantee for this class.
-        assert PackagesClass().probe_commands(Candidate("packages", "pip_uninstall", "x")) == []
-
 
 # ===========================================================================
 # SQL
@@ -216,14 +212,3 @@ class TestSqlAssess:
             tmp_path,
         )
         assert c is not None and 0.5 <= c.floor < 0.85
-
-
-class TestSqlProbeSurface:
-    def test_sqlite_probe_is_read_only(self) -> None:
-        cmds = SqlClass().probe_commands(Candidate("sql", "drop", "x", ("sqlite", "app.db")))
-        assert cmds  # sqlite does probe
-        for q in cmds:
-            assert q[0] in ("SELECT", "PRAGMA", "EXPLAIN")
-
-    def test_non_sqlite_has_no_probe(self) -> None:
-        assert SqlClass().probe_commands(Candidate("sql", "drop", "x", ("postgres", ""))) == []
