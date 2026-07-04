@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from blast_scope.command_effects import classify_effect, command_weight, canonicalize
+from blast_scope.command_effects import classify_effect, canonicalize
 from blast_scope.command_parser import parse_command
 
 
@@ -54,16 +54,16 @@ class TestGitSubcommands:
 
 class TestWeights:
     def test_read_is_zero(self) -> None:
-        assert command_weight("cat", [], "read") == 0.0
+        assert classify_effect("cat", [], []).weight == 0.0
 
     def test_recursive_chmod_escalates(self) -> None:
-        base = command_weight("chmod", [], "destructive")
-        rec = command_weight("chmod", ["-R"], "destructive")
+        base = classify_effect("chmod", [], ["file"]).weight
+        rec = classify_effect("chmod", ["-R"], ["dir"]).weight
         assert rec > base
 
     def test_unknown_destructive_fallback(self) -> None:
         # find isn't in the weight table; a destructive find still gets weight.
-        assert command_weight("find", ["-delete"], "destructive") >= 0.5
+        assert classify_effect("find", ["-delete"], ["."]).weight >= 0.5
 
 
 class TestPowerShell:

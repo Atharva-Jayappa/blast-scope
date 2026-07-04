@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from blast_scope.command_effects import classify_effect
 from blast_scope.command_parser import ParsedCommand
 from blast_scope.consequences import Consequence
 from blast_scope.graph_resolver import GraphResolution, ResolvedNode
@@ -28,12 +29,17 @@ def _make_parsed(
     intent: str = "destructive",
     recursive: bool = False,
     reversible: bool = False,
+    weight: float | None = None,
 ) -> ParsedCommand:
+    if weight is None:
+        weight = classify_effect(command, flags or [], targets or []).weight
     return ParsedCommand(
         command=command,
         targets=targets or [],
+        write_targets=targets or [],
         flags=flags or [],
         intent=intent,
+        weight=weight,
         recursive=recursive,
         reversible=reversible,
     )

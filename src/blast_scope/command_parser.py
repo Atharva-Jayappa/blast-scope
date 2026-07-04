@@ -43,6 +43,7 @@ class ParsedCommand(TypedDict):
     write_targets: list[str]  # subset of targets actually overwritten/destroyed
     flags: list[str]
     intent: str  # "destructive" | "additive" | "read" | "unknown"
+    weight: float  # inherent danger of the verb (operand-aware), from classify_effect
     recursive: bool
     reversible: bool
 
@@ -198,6 +199,7 @@ def parse_command(
         write_targets=write_targets,
         flags=flags,
         intent=intent,
+        weight=effect.weight,
         recursive=recursive,
         reversible=reversible,
     )
@@ -388,6 +390,7 @@ def _empty_result() -> ParsedCommand:
         write_targets=[],
         flags=[],
         intent="unknown",
+        weight=0.0,
         recursive=False,
         reversible=False,
     )

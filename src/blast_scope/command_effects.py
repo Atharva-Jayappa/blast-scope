@@ -194,37 +194,6 @@ def classify_effect(
     return eff
 
 
-def command_weight(command: str, flags: list[str] | None, intent: str) -> float:
-    """Operand-free weight lookup for the scorer.
-
-    The full :func:`classify_effect` needs operands; the scorer only has the
-    command, flags and the already-computed intent. This derives a weight
-    consistent with the effect tables.
-
-    Example::
-
-        >>> command_weight("rm", ["-rf"], "destructive")
-        0.9
-    """
-    if intent == "read":
-        return 0.0
-    flags = flags or []
-    cmd = command.lower()
-    w = COMMAND_WEIGHTS.get(cmd)
-    if w is None:
-        # Command not in the table (e.g. find -delete, git reset --hard) —
-        # fall back to an intent-based estimate.
-        if intent == "destructive":
-            w = 0.7
-        elif intent == "additive":
-            w = 0.15
-        else:
-            w = DEFAULT_WEIGHT
-    if cmd in ("chmod", "chown") and _is_recursive(flags):
-        w = min(1.0, w * 1.6)
-    return w
-
-
 def canonicalize(command: str) -> str:
     """Map a PowerShell/cmd verb or alias to its canonical command name.
 
