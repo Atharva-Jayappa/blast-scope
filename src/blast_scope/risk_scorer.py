@@ -102,7 +102,12 @@ class ChainAssessment(TypedDict):
 # isn't a path the caps reason about — otherwise the bogus `absent` cap (from
 # treating e.g. a git subcommand token as a missing file) would crush a real
 # consequence. Path-tied domains (infra/config) stay BEFORE the caps.
-_STATE_TIED_DOMAINS: frozenset[str] = frozenset({"vcs", "docker", "packages", "sql"})
+# "resolution" is state-tied for the same reason: an unset-var hazard's danger
+# is that the residual path is NOT the one intended — the residue often looks
+# `absent`/benign, which is exactly what the caps must not use to crush it.
+_STATE_TIED_DOMAINS: frozenset[str] = frozenset(
+    {"vcs", "docker", "packages", "sql", "resolution"}
+)
 
 # In-degree normalization ceiling (10+ importers = max risk)
 _IN_DEGREE_CEILING: int = 10
@@ -234,6 +239,9 @@ def score_risk(
             score = min(score, 0.1)
         elif cat == "regenerable":
             score = min(score, 0.15)
+        elif destroys and cat == "system_root":
+            # The filesystem root / home directory — maximal blast radius.
+            score = max(score, 0.9)
         elif destroys and cat == "secret":
             score = max(score, 0.85)
         elif destroys and cat == "repo_history":
@@ -275,8 +283,15 @@ def score_risk(
     # ability/rationale derived from them is misleading noise ("path does not
     # exist — nothing to lose" on `git reset --hard`). When such a consequence
     # is present, lead the explanation with IT rather than the path model.
+    # Resolution notes at floor 0 are pure evidence ("glob matched 12 files");
+    # only a real resolution *hazard* (floor > 0) may lead the rationale.
     state_consequences = (
-        [c for c in consequences if c.domain in _STATE_TIED_DOMAINS]
+        [
+            c
+            for c in consequences
+            if c.domain in _STATE_TIED_DOMAINS
+            and not (c.domain == "resolution" and c.floor <= 0.0)
+        ]
         if consequences
         else []
     )

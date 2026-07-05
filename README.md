@@ -106,6 +106,7 @@ in [`src/blast_scope/classes/`](src/blast_scope/classes); each class confines
 | Capability | Module |
 |---|---|
 | Flag/operand-sensitive command model (POSIX **and** PowerShell) | `command_effects.py`, `command_parser.py` |
+| **Command resolution** — env/tilde/brace/glob expansion, unset-var hazards, script transparency (`sh -c`, `npm run` + pre/post hooks, script files, Makefile targets), read-only `$(...)` substitution | `resolution.py` |
 | Recoverability classification (git state, secrets, regenerable, precious data) | `recoverability.py` |
 | Dependency graph + weighted **PageRank** centrality, incremental indexing | `graph_resolver.py`, `centrality.py` |
 | Two-axis, evidence-based filesystem scoring | `risk_scorer.py` |
@@ -116,16 +117,20 @@ in [`src/blast_scope/classes/`](src/blast_scope/classes); each class confines
 
 **Calibration.** Two harnesses, both run-it-yourself:
 
-- **In-repo corpus** (`tests/fixtures/eval_corpus.jsonl`, 38 cases spanning every
+- **In-repo corpus** (`tests/fixtures/eval_corpus.jsonl`, 49 cases spanning every
   recoverability category, git working-tree state, infra/config, `rm -rf .git`,
-  a graph-indexed central module, and the git/docker/pip/SQL classes) —
-  **38/38 exact severity, gate F1 1.00**, pinned by `tests/test_eval.py` with
-  headroom so changes can't silently regress.
+  a graph-indexed central module, the git/docker/pip/SQL classes, and the
+  resolution layer — unset-var collapses, glob/env-var targets, `sh -c`
+  payloads, npm pre-hooks, opaque wrappers) — **49/49 exact severity, gate F1
+  1.00**, pinned by `tests/test_eval.py` with headroom so changes can't
+  silently regress.
 - **[SABER](https://github.com/sssr-lab/saber)** — 716 real coding-agent
   workspaces. Against ~1725 safe commands, blast-scope's **false-positive rate is
-  0.4%**; on its core competency (`data_destruction`) it catches **76.5%** of
-  injected attacks on realistic workspaces (**82%** with the dependency graph
-  built). The per-category recall is deliberately uneven, and the table says so:
+  0.58%**; on its core competency (`data_destruction`) it catches **82.4%** of
+  injected attacks on realistic workspaces — on the fast hook path, no graph
+  required, thanks to command resolution (env/glob binding + script
+  transparency). Wrapper transparency also lifts `code_tampering` from ~0% to
+  **50%**. The per-category recall is deliberately uneven, and the table says so:
   blast-scope scores *destructive consequence* — filesystem/data loss plus
   git/docker/pip/SQL state. Network exfiltration and persistence are a **different
   threat model, out of scope by design** — not an unfinished corner. That's the

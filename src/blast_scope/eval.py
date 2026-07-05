@@ -152,9 +152,20 @@ def evaluate_case(case: dict[str, Any]) -> CaseResult:
         root = Path(tmp)
         _materialize(case, root)
         clear_cache()
+        # Deterministic env for $VAR resolution: exactly what the case declares
+        # (with "{root}" rewritten to the temp project), never the harness's
+        # own environment. An absent "env" key means "no variables set".
+        env = {
+            k: v.replace("{root}", str(root))
+            for k, v in (case.get("setup", {}).get("env") or {}).items()
+        }
         try:
             assessment = assess(
-                case["command"], cwd=str(root), project_root=str(root), auto_index=index
+                case["command"],
+                cwd=str(root),
+                project_root=str(root),
+                auto_index=index,
+                env=env,
             )
         finally:
             # Release the graph DB handle before the temp dir is cleaned up.

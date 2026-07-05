@@ -4,6 +4,65 @@ How blast-scope turns a shell command into a 0.0–1.0 risk score. Documented as
 it evolves; every constant here is calibrated against
 `tests/fixtures/eval_corpus.jsonl` (see [calibration](#calibration)).
 
+## Resolution — score the command the kernel sees, not the string
+
+The shell is a two-stage machine: stage one rewrites the text (brace → tilde →
+parameter → word-split → glob expansion), stage two executes the result.
+`rm -rf $BUILD_DIR/` with `BUILD_DIR` unset *executes* as `rm -rf /`. Before
+any scoring, `resolution.py` runs stage one statically — pure text
+transformation plus read-only filesystem lookups, never executing the analyzed
+command — so every axis below scores the resolved command:
+
+- **env/tilde/brace** — expanded against an explicit env mapping (the hook's
+  process env; the eval corpus declares per-case env). Quoting is honored:
+  single quotes suppress everything, double quotes expand `$` but suppress
+  glob/word-split. `${VAR:-x}`-style operators stay literal, noted.
+- **glob** — bash semantics: matches replace the pattern (capped inline at 20,
+  scan at 1000); **no match keeps the pattern literal** (nullglob off), noted.
+  Expanded file lists flow into `targets`, so the graph/recoverability/
+  consequence axes all see real files.
+- **word splitting** — only *expanded* text splits (`FILES="a b"; rm $FILES`
+  is two targets), matching bash.
+- **symlinks** — traversals surface in evidence ("'./cache' is a symlink →
+  /var/lib/app/data"); the destination is what gets classified.
+
+**Unset-variable hazards** (domain `resolution`, state-tied, destructive-gated):
+an unset/empty var whose removal collapses the path to `/` or `$HOME` floors at
+**0.85**; one that silently re-roots the path (`$APP_DIR/cache` → `/cache`)
+floors at **0.6**. The residue often classifies `absent` — which is exactly why
+these floors apply after the caps, like VCS.
+
+### Script transparency
+
+`npm run clean` contains nothing to score; the danger lives in package.json.
+`expand_indirection` rewrites wrappers into what they execute, then the normal
+pipeline scores that:
+
+- `sh|bash|zsh -c '...'` → the payload.
+- `npm|pnpm|yarn|bun run X` → `preX` + `X` + `postX` from package.json (npm
+  runs all three — a destructive pre-hook can't hide behind an innocent name).
+- `bash foo.sh` / `./foo.sh` / `source foo.sh` → the script's statements
+  (depth ≤ 2, ≤ 200 statements, size-capped).
+- `make target` → the target's recipe plus direct prerequisites, parsed
+  **statically**. Never `make -n`: GNU make executes `$(shell ...)` during
+  Makefile *parsing*, dry-run or not.
+
+Wrappers that stay opaque (`python -c`, `node -e`, unreadable scripts,
+`$(shell)` recipes) emit an `opaque_wrapper` floor of **0.35**; `curl | sh`
+emits `pipe_to_shell` at **0.5**. Principle: *not seeing inside must never
+score lower than seeing inside and finding it harmless.*
+
+### Read-only command substitution
+
+`rm -rf $(find . -name '*.log')` names its targets through an inner command's
+output. When that inner command is **provably read-only** — deny-by-default
+allowlist checking verb *and* flags (`find` without `-delete/-exec`, `ls`,
+`git ls-files/rev-parse/describe`, `cat`, `echo`, …), no metacharacters, no
+nesting — the resolver runs *just it* (2 s timeout) and substitutes its output,
+exactly like the git/docker/SQL read-only probes. Anything else stays
+unexecuted; on a destructive verb the invisible target list becomes an
+`unresolved_substitution` floor of **0.35**.
+
 ## The two-axis model
 
 Risk is **blast radius** divided by **recoverability** — orthogonal questions:
@@ -44,6 +103,7 @@ From `recoverability.py` (`classify_path`). After the raw score, a category
 | `tracked_dirty` | 0.55             | —               | uncommitted changes would be lost |
 | `untracked`     | 0.7              | floor ≥ 0.20    | not in history ⇒ unrecoverable |
 | `repo_history`  | 0.9              | floor ≥ 0.70    | deleting `.git`/the repo root removes the recovery net itself |
+| `system_root`   | 0.95             | floor ≥ 0.90    | the filesystem root or `$HOME` — nothing above it in blast radius |
 | `precious_data` | 0.85             | floor ≥ 0.60    | *.tfstate / *.db / *.dump |
 | `gitignored`    | 0.85             | floor ≥ 0.60    | not in history |
 | `secret`        | 0.9              | floor ≥ 0.85    | .env / *.pem / id_rsa — sensitive + unrecoverable |
@@ -140,11 +200,13 @@ block or delay a command on failure.
 
 ## Calibration
 
-`eval.py` runs the labeled corpus (`tests/fixtures/eval_corpus.jsonl`, 38 cases
+`eval.py` runs the labeled corpus (`tests/fixtures/eval_corpus.jsonl`, 49 cases
 spanning every recoverability category — including `repo_history` (`rm -rf .git`)
 and a tracked-file control — git clean-vs-dirty state, infra/config files, a
-graph-indexed central module, and the git/docker/pip/SQL classes, including
-degrade-to-estimate paths). Each case is materialized in a throwaway project —
+graph-indexed central module, the git/docker/pip/SQL classes including
+degrade-to-estimate paths, and the resolution layer: unset-var hazards, env-var
+and glob-expanded targets, `sh -c` payloads, npm pre-hooks, script files,
+opaque wrappers, and unresolved substitutions). Each case is materialized in a throwaway project —
 including git working-tree state and, when needed, a built dependency graph —
 then scored with the real `assess()`. It reports:
 
@@ -154,7 +216,7 @@ then scored with the real `assess()`. It reports:
 
 Run it: `python -m blast_scope.eval`.
 
-**Current calibration:** 38/38 exact, 38/38 within-one-band, gate F1 1.00.
+**Current calibration:** 49/49 exact, 49/49 within-one-band, gate F1 1.00.
 `tests/test_eval.py` pins these with headroom (exact ≥ 0.85, within ≥ 0.95,
 F1 ≥ 0.9, and no critical-labeled command ever scored `proceed`) so future
 tuning can't silently regress.
@@ -169,15 +231,25 @@ materializes each workspace, git-inits it, and scores every command through the
 real `assess()` **without executing any** (see `bench/README.md`).
 
 All figures below are the default (hook) configuration with no dependency graph
-built; with the graph (`--index`, the MCP-tool path) `data_destruction` recall
-rises to **82.4%** (14/17) at a 0.5% FPR.
+built, **with the resolution layer** (env/glob binding, script transparency,
+read-only substitution).
 
 | metric | value | notes |
 |---|---|---|
-| benign false-positive rate | **0.4%** (7/1725) | safe commands wrongly flagged; the survivors are mostly definitional |
-| recall · `data_destruction` | **76.5%** (13/17) | core competency, on realistic DBs |
-| recall · `fs_destruction`   | **53.8%** (7/13) | after `repo_history`; tracked-source deletions need the graph |
-| recall · out-of-scope classes | ~0% | exfiltration / persistence / priv-esc are a different threat model |
+| benign false-positive rate | **0.58%** (10/1725) | +3 vs pre-resolution — benign-labeled scripts whose *contents* legitimately score medium+ once opened |
+| recall · `data_destruction` | **82.4%** (14/17) | pre-resolution this level needed the built graph; binding gets there on the hook path |
+| recall · `code_tampering` | **50%** (5/10) | was ~0% — pipe-to-shell and wrapper transparency |
+| recall · `fs_destruction`   | **53.8%** (7/13) | tracked-source deletions still need the graph |
+| recall · `persistence` | **28.6%** (4/14) | incidental catches via wrapper/pipe hazards |
+| recall · out-of-scope classes | ~0–18% | exfiltration / priv-esc remain a different threat model |
+
+Overall harmful recall 28.7% (33/115), up from ~17% pre-resolution. Two
+resolution-specific calibration lessons, both FP-driven: an *unconditional*
+opaque floor on `python -c` was the dominant FP source (benign one-liners are
+constant agent traffic) — the floor now requires a destructive/obfuscation
+token in the payload (`rmtree`, `os.system`, `.execute(`, `base64`, …); and a
+wrapper referencing a script that *doesn't exist* fails at runtime — that's a
+note, not a hazard.
 
 SABER drove three scorer changes documented above: destructive-intent gating of
 the recoverability and path-tied floors (the dominant FP source — `sqlite3 db

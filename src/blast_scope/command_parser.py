@@ -12,7 +12,7 @@ import re
 import shlex
 import subprocess
 from pathlib import Path
-from typing import TypedDict
+from typing import Callable, TypedDict
 
 from blast_scope.command_effects import canonicalize, classify_effect
 
@@ -343,7 +343,10 @@ def parse_command_chain(
 
 
 def parse_chain_with_segments(
-    raw: str, cwd: Path | None = None, shell: str = "auto"
+    raw: str,
+    cwd: Path | None = None,
+    shell: str = "auto",
+    transform: Callable[[str, Path], str] | None = None,
 ) -> tuple[list[str], list[ParsedCommand]]:
     """Split a chain once and parse each segment, returning both in lockstep.
 
@@ -351,6 +354,12 @@ def parse_chain_with_segments(
     caller that needs the raw segment text alongside the parse (the server, for
     its per-segment consequence analysis) can't drift the two out of alignment
     by splitting the command twice.
+
+    ``transform`` is an optional per-segment rewrite hook ``(segment, cwd) →
+    segment`` applied before parsing — the server passes the resolution pass
+    here so expansion sees the correct per-segment cwd (a leading ``cd``
+    updates it). The returned segments are the transformed texts, so every
+    downstream consumer scores what the shell would execute.
 
     Example::
 
@@ -361,10 +370,17 @@ def parse_chain_with_segments(
         cwd = Path.cwd()
 
     segments = split_command_chain(raw)[:MAX_CHAIN_SEGMENTS]
+    out_segments: list[str] = []
     parsed_list: list[ParsedCommand] = []
     current_cwd = cwd
 
     for segment in segments:
+        if transform is not None:
+            try:
+                segment = transform(segment, current_cwd)
+            except Exception:  # resolution is advisory — never break parsing
+                logger.exception("segment transform failed for %r", segment)
+        out_segments.append(segment)
         parsed = parse_command(segment, cwd=current_cwd, shell=shell)
         parsed_list.append(parsed)
 
@@ -374,7 +390,7 @@ def parse_chain_with_segments(
             if new_dir.is_dir():
                 current_cwd = new_dir
 
-    return segments, parsed_list
+    return out_segments, parsed_list
 
 
 # ---------------------------------------------------------------------------

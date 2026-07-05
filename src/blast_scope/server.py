@@ -10,10 +10,12 @@ import glob
 import itertools
 import logging
 from pathlib import Path
+from typing import Mapping
 
 from mcp.server.fastmcp import FastMCP
 
 from blast_scope import consequences as consequence_engine
+from blast_scope import resolution as resolution_engine
 from blast_scope import snapshot as snapshot_engine
 from blast_scope.command_parser import parse_chain_with_segments
 from blast_scope.graph_resolver import GraphResolver
@@ -96,6 +98,7 @@ def assess(
     cwd: str | None = None,
     project_root: str | None = None,
     auto_index: bool = True,
+    env: Mapping[str, str] | None = None,
 ) -> dict:
     """Score a (possibly chained) shell command. Pure of MCP plumbing.
 
@@ -104,15 +107,55 @@ def assess(
     whether a missing graph is built (the tool builds it; the hook does not, to
     keep per-command latency low).
 
+    Each segment is first *resolved* — env vars, tilde, braces, and globs
+    expanded the way the shell would (see :mod:`blast_scope.resolution`) — so
+    every scoring axis sees the command the kernel would execute, not the raw
+    string. ``env`` is the environment for ``$VAR`` expansion; ``None`` uses
+    the process environment (the hook shares the agent's env), and callers
+    needing determinism (the eval harness) pass an explicit mapping.
+
     Example::
 
         >>> assess("rm -rf ./config", cwd="/proj", project_root="/proj")["severity"]
         'critical'
     """
     working_dir = Path(cwd) if cwd else Path.cwd()
+    root_path = Path(project_root) if project_root else None
+
+    # Script transparency: rewrite wrapper commands (sh -c, npm run, script
+    # files, make targets) into what they actually execute, so the chain
+    # below scores the real commands. Wrappers that stay opaque contribute
+    # an uncertainty floor instead.
+    try:
+        indirection = resolution_engine.expand_indirection(command, working_dir)
+        command = indirection.command
+    except Exception:  # advisory — never break assessment
+        logger.exception("indirection expansion failed for %r", command)
+        indirection = None
+
+    # Resolution pass: expand each segment against filesystem + env truth.
+    # The closure appends exactly one Resolution per call — degrading to a
+    # no-op Resolution on any error — so it stays 1:1 with the segments.
+    seg_resolutions: list[resolution_engine.Resolution] = []
+
+    def _resolve(segment: str, seg_cwd: Path) -> str:
+        try:
+            res = resolution_engine.resolve_segment(
+                segment, seg_cwd, env=env, project_root=root_path
+            )
+        except Exception:  # resolution is advisory — never break assessment
+            logger.exception("resolution failed for %r", segment)
+            res = resolution_engine.Resolution(
+                original=segment, resolved=segment, notes=(), hazards=()
+            )
+        seg_resolutions.append(res)
+        return res.resolved
+
     # One split → segments and their parses stay 1:1 aligned (and the chain cap
     # is applied once, inside the helper).
-    segments, parsed_list = parse_chain_with_segments(command, cwd=working_dir)
+    segments, parsed_list = parse_chain_with_segments(
+        command, cwd=working_dir, transform=_resolve
+    )
 
     resolutions_per_command: list = []
     if project_root and (auto_index or _graph_exists(Path(project_root))):
@@ -133,11 +176,58 @@ def assess(
 
     # Out-of-graph consequences (VCS history, infra/deploy, config-by-path)
     # per command, gathered against the working dir and project root.
-    root_path = Path(project_root) if project_root else None
     consequences_per_command = [
         consequence_engine.gather(parsed, segment, working_dir, root_path)
         for parsed, segment in zip(parsed_list, segments)
     ]
+
+    # Fold resolution findings in as consequences: hazards carry floors
+    # (gated on destructive intent — an unset var in `echo $X/` is noise),
+    # expansion notes carry evidence at floor 0 so the advisory can show
+    # "what the command actually resolves to".
+    for i, res in enumerate(seg_resolutions[: len(parsed_list)]):
+        extra: list[consequence_engine.Consequence] = []
+        for hazard in res.hazards:
+            # unset-var hazards apply only when the resolved command is
+            # genuinely destructive. unresolved_substitution self-gates in
+            # the resolver (destructive verb + invisible target list) and
+            # must survive the parser's subshell bail to intent=unknown.
+            if (
+                parsed_list[i]["intent"] == "destructive"
+                or hazard.kind == "unresolved_substitution"
+            ):
+                extra.append(
+                    consequence_engine.Consequence(
+                        domain="resolution", floor=hazard.floor, evidence=hazard.detail
+                    )
+                )
+        for note in res.notes[:3]:
+            extra.append(
+                consequence_engine.Consequence(
+                    domain="resolution", floor=0.0, evidence=note.detail
+                )
+            )
+        if extra:
+            consequences_per_command[i] = list(consequences_per_command[i] or []) + extra
+
+    # Indirection findings attach to the first step: opaque-wrapper hazards
+    # are UNGATED (an unopenable wrapper has unknown intent by definition —
+    # that's the point), and the expansion trail rides along as evidence.
+    if indirection is not None and parsed_list:
+        extra = [
+            consequence_engine.Consequence(
+                domain="resolution", floor=h.floor, evidence=h.detail
+            )
+            for h in indirection.hazards
+        ]
+        extra.extend(
+            consequence_engine.Consequence(
+                domain="resolution", floor=0.0, evidence=n.detail
+            )
+            for n in indirection.notes[:3]
+        )
+        if extra:
+            consequences_per_command[0] = list(consequences_per_command[0] or []) + extra
 
     assessment = score_chain(
         parsed_list,

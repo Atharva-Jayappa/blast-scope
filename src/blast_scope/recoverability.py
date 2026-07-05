@@ -187,6 +187,14 @@ def classify_path(path: Path) -> Recoverability:
     name = path.name.lower()
     exists = path.exists()
 
+    # The filesystem root or the user's home directory: nothing above these
+    # in blast radius, and no git history spans them. `rm -rf /` must never
+    # read as an ordinary untracked directory.
+    if path == Path(path.anchor) or path == Path.home():
+        what = "the filesystem root" if path == Path(path.anchor) else "the home directory"
+        return _r("system_root", 0.95, False,
+                  f"target is {what} — everything beneath it goes")
+
     # Deleting something that isn't there has no blast radius.
     if not exists:
         return _r("absent", 0.0, True, "path does not exist — nothing to lose")
