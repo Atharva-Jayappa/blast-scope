@@ -1,6 +1,6 @@
 [project]
 name = "blast-scope"
-version = "0.4.0"
+version = "0.4.1"
 description = "Contextual blast-radius scoring for shell commands an AI agent is about to run"
 readme = "README.md"
 requires-python = ">=3.11"
