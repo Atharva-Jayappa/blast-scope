@@ -253,6 +253,14 @@ def score_risk(
             # Not in git history → unrecoverable once destroyed. Even an
             # unknown file is at least a medium concern when it's gone for good.
             score = max(score, 0.2)
+        elif destroys and cat in ("tracked_clean", "tracked_dirty"):
+            # Mass destruction of tracked content. Git CAN restore it — which
+            # is why the multiplicative axis scores it low — but wiping many
+            # source files (`truncate -s 0 **/*.py`) or whole source dirs
+            # (`rm -rf src tests`) at once is never a silent-proceed op.
+            # A single tracked file stays low: that's routine.
+            if _is_mass_destruction(parsed):
+                score = max(score, 0.55)
 
     # State-tied consequences (git working tree, docker volumes, package envs,
     # SQL tables) are orthogonal to the target *path* — the danger is in runtime
@@ -321,6 +329,54 @@ def score_risk(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+# Extensions that mark a file as source code for the mass-destruction gate.
+_SOURCE_EXTS: frozenset[str] = frozenset(
+    {
+        ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".java", ".rb",
+        ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".php", ".swift", ".kt",
+        ".scala", ".sh",
+    }
+)
+_MASS_SOURCE_FILES: int = 3
+_MASS_WALK_CAP: int = 400
+
+
+def _is_mass_destruction(parsed: ParsedCommand) -> bool:
+    """True when a destructive command hits ≥3 source files, directly or via dirs.
+
+    Content-aware on purpose: `rm -rf tmp/ downloads/` on tracked junk dirs is
+    routine cleanup, `rm -rf src tests` guts the codebase — "is a directory"
+    can't tell them apart, "contains source code" can.
+
+    Example::
+
+        >>> _is_mass_destruction(parse_command("rm -rf src tests"))  # dirs of .py
+        True
+    """
+    targets = parsed.get("write_targets") or parsed["targets"]
+    count = 0
+    for t in targets:
+        p = Path(t)
+        try:
+            if p.is_dir():
+                if not parsed["recursive"]:
+                    continue
+                for i, f in enumerate(p.rglob("*")):
+                    if i >= _MASS_WALK_CAP:
+                        break
+                    if f.suffix.lower() in _SOURCE_EXTS:
+                        count += 1
+                        if count >= _MASS_SOURCE_FILES:
+                            return True
+            elif p.suffix.lower() in _SOURCE_EXTS:
+                count += 1
+                if count >= _MASS_SOURCE_FILES:
+                    return True
+        except OSError:
+            continue
+    return False
 
 
 def _score_to_severity(score: float) -> str:
@@ -436,6 +492,17 @@ def _build_evidence(
 
     if parsed["recursive"]:
         evidence.append("recursive — applies to every file underneath")
+
+    if (
+        parsed["intent"] == "destructive"
+        and recoverability is not None
+        and recoverability["category"] in ("tracked_clean", "tracked_dirty")
+        and _is_mass_destruction(parsed)
+    ):
+        evidence.append(
+            "mass destruction of tracked content — git can restore it, but "
+            "not silently: confirm this is intended"
+        )
 
     return evidence
 

@@ -1,0 +1,9 @@
+blast-scope
+Copyright 2026 Atharva Jayappa
+
+Licensed under the Apache License, Version 2.0.
+Versions up to and including 0.3.1 were published under the MIT License.
+
+This product includes code vendored from code-review-graph
+(https://github.com/tirth8205/code-review-graph), Copyright (c) 2026 Tirth
+Kanani, used under the MIT License. See src/blast_scope/vendor/crg/LICENSE.

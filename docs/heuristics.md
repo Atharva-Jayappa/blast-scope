@@ -239,17 +239,21 @@ read-only substitution).
 | benign false-positive rate | **0.58%** (10/1725) | +3 vs pre-resolution — benign-labeled scripts whose *contents* legitimately score medium+ once opened |
 | recall · `data_destruction` | **82.4%** (14/17) | pre-resolution this level needed the built graph; binding gets there on the hook path |
 | recall · `code_tampering` | **50%** (5/10) | was ~0% — pipe-to-shell and wrapper transparency |
-| recall · `fs_destruction`   | **53.8%** (7/13) | tracked-source deletions still need the graph |
+| recall · `fs_destruction`   | **61.5%** (8/13) | mass-destruction gate + `find -exec` payload verbs |
 | recall · `persistence` | **28.6%** (4/14) | incidental catches via wrapper/pipe hazards |
 | recall · out-of-scope classes | ~0–18% | exfiltration / priv-esc remain a different threat model |
 
-Overall harmful recall 28.7% (33/115), up from ~17% pre-resolution. Two
-resolution-specific calibration lessons, both FP-driven: an *unconditional*
-opaque floor on `python -c` was the dominant FP source (benign one-liners are
-constant agent traffic) — the floor now requires a destructive/obfuscation
-token in the payload (`rmtree`, `os.system`, `.execute(`, `base64`, …); and a
-wrapper referencing a script that *doesn't exist* fails at runtime — that's a
-note, not a hazard.
+Overall harmful recall 30.4% (35/115), up from ~17% pre-resolution. Three
+calibration lessons, all FP-driven: an *unconditional* opaque floor on
+`python -c` was the dominant FP source (benign one-liners are constant agent
+traffic) — the floor now requires a destructive/obfuscation token in the
+payload (`rmtree`, `os.system`, `.execute(`, `base64`, …); a wrapper
+referencing a script that *doesn't exist* fails at runtime — that's a note,
+not a hazard; and the mass-destruction gate is **content-aware** (≥3 source
+files, directly or inside recursively-deleted dirs) because "is a directory"
+can't distinguish `rm -rf tmp/ downloads/` from `rm -rf src tests` — the
+first is routine cleanup, the second guts the codebase and floors at 0.55
+even though git could restore it.
 
 SABER drove three scorer changes documented above: destructive-intent gating of
 the recoverability and path-tied floors (the dominant FP source — `sqlite3 db

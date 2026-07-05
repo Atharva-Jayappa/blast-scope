@@ -1,11 +1,11 @@
 [project]
 name = "blast-scope"
-version = "0.3.1"
+version = "0.4.0"
 description = "Contextual blast-radius scoring for shell commands an AI agent is about to run"
 readme = "README.md"
 requires-python = ">=3.11"
-license = "MIT"
-license-files = ["LICENSE"]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Atharva Jayappa", email = "jatharva289@gmail.com" }]
 keywords = [
     "mcp", "ai-agents", "claude-code", "shell", "safety",

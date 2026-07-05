@@ -239,7 +239,10 @@ def _safer(cmd: str) -> str | None:
 
 def _classify_find(flags: list[str], operands: list[str], recursive: bool) -> Effect:
     has_delete = "-delete" in flags
-    has_exec_rm = "-exec" in flags and any(o in ("rm", "rmdir", "shred") for o in operands)
+    _DESTRUCTIVE_EXEC = ("rm", "rmdir", "shred", "truncate", "dd", "mv", "chmod")
+    has_exec_rm = ("-exec" in flags or "-execdir" in flags) and any(
+        o in _DESTRUCTIVE_EXEC for o in operands
+    )
     if has_delete or has_exec_rm:
         return Effect(
             "destructive",

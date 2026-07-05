@@ -306,3 +306,12 @@ blast-scope/
 - Optional richer interception modes beyond advisory.
 
 See [CLAUDE.md](CLAUDE.md) for the full spec, contracts, and design rules.
+
+---
+
+## License
+
+[Apache 2.0](LICENSE) (versions ≤ 0.3.1 were MIT). The vendored
+[code-review-graph](https://github.com/tirth8205/code-review-graph) sources
+remain MIT under their [upstream notice](src/blast_scope/vendor/crg/LICENSE) —
+see [NOTICE](NOTICE).
