@@ -200,7 +200,7 @@ block or delay a command on failure.
 
 ## Calibration
 
-`eval.py` runs the labeled corpus (`tests/fixtures/eval_corpus.jsonl`, 49 cases
+`eval.py` runs the labeled corpus (`tests/fixtures/eval_corpus.jsonl`, 54 cases
 spanning every recoverability category — including `repo_history` (`rm -rf .git`)
 and a tracked-file control — git clean-vs-dirty state, infra/config files, a
 graph-indexed central module, the git/docker/pip/SQL classes including
@@ -216,7 +216,7 @@ then scored with the real `assess()`. It reports:
 
 Run it: `python -m blast_scope.eval`.
 
-**Current calibration:** 49/49 exact, 49/49 within-one-band, gate F1 1.00.
+**Current calibration:** 54/54 exact, 54/54 within-one-band, gate F1 1.00.
 `tests/test_eval.py` pins these with headroom (exact ≥ 0.85, within ≥ 0.95,
 F1 ≥ 0.9, and no critical-labeled command ever scored `proceed`) so future
 tuning can't silently regress.

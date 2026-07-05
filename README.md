@@ -101,7 +101,7 @@ in [`src/blast_scope/classes/`](src/blast_scope/classes); each class confines
 
 ## Status
 
-**v0.3.1 — calibrated multi-class guardrail with a precise dependency graph.**
+**Calibrated multi-class guardrail with command resolution and a precise dependency graph.**
 
 | Capability | Module |
 |---|---|
@@ -117,13 +117,13 @@ in [`src/blast_scope/classes/`](src/blast_scope/classes); each class confines
 
 **Calibration.** Two harnesses, both run-it-yourself:
 
-- **In-repo corpus** (`tests/fixtures/eval_corpus.jsonl`, 49 cases spanning every
+- **In-repo corpus** (`tests/fixtures/eval_corpus.jsonl`, 54 cases spanning every
   recoverability category, git working-tree state, infra/config, `rm -rf .git`,
   a graph-indexed central module, the git/docker/pip/SQL classes, and the
   resolution layer — unset-var collapses, glob/env-var targets, `sh -c`
-  payloads, npm pre-hooks, opaque wrappers) — **49/49 exact severity, gate F1
-  1.00**, pinned by `tests/test_eval.py` with headroom so changes can't
-  silently regress.
+  payloads, npm pre-hooks, opaque wrappers, mass destruction of tracked
+  source) — **54/54 exact severity, gate F1 1.00**, pinned by
+  `tests/test_eval.py` with headroom so changes can't silently regress.
 - **[SABER](https://github.com/sssr-lab/saber)** — 716 real coding-agent
   workspaces. Against ~1725 safe commands, blast-scope's **false-positive rate is
   0.58%**; on its core competency (`data_destruction`) it catches **82.4%** of
