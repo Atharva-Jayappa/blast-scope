@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run test suite
+        run: uv run --extra dev pytest -q
+      - name: Run calibration eval (floors pinned in tests, shown here for visibility)
+        run: uv run python -m blast_scope.eval
+
+  build:
+    name: build wheel + sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - name: Check wheel ships licenses and vendored notice
+        run: |
+          uv run python - << 'EOF'
+          import glob, zipfile
+          whl = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(whl).namelist()
+          for needle in ("licenses/LICENSE", "licenses/NOTICE", "vendor/crg/LICENSE"):
+              assert any(needle in n for n in names), f"missing {needle} in wheel"
+          print("wheel license contents OK")
+          EOF
+
+  ci-ok:
+    # Single required status check for branch protection — green only when
+    # every matrix job and the build succeed.
+    name: ci-ok
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "all green"
