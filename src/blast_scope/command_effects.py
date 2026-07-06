@@ -166,6 +166,8 @@ def classify_effect(
         return _classify_dd(operands)
     if cmd == "git":
         return _classify_git(operands, flags)
+    if cmd == "rsync":
+        return _classify_rsync(flags)
 
     # --- static classification ---
     if cmd in _READ_COMMANDS:
@@ -252,6 +254,18 @@ def _classify_find(flags: list[str], operands: list[str], recursive: bool) -> Ef
             safer_alternative="run without -delete/-exec first to review the match list",
         )
     return Effect("read", 0.0)
+
+
+def _classify_rsync(flags: list[str]) -> Effect:
+    """rsync is additive-ish, but ``--delete`` removes destination files."""
+    if any(f.startswith("--delete") for f in flags):
+        return Effect(
+            "destructive",
+            0.6,
+            note="rsync --delete removes destination files missing from the source",
+            safer_alternative="preview with --dry-run --itemize-changes first",
+        )
+    return Effect("additive", 0.2, note="rsync overwrites matching destination files")
 
 
 def _classify_sed(flags: list[str]) -> Effect:

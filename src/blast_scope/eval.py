@@ -92,7 +92,7 @@ def load_corpus(path: Path | str = DEFAULT_CORPUS) -> list[dict[str, Any]]:
 
 
 def _materialize(case: dict[str, Any], root: Path) -> None:
-    """Create the files, directories, and git state a case declares."""
+    """Create the files, directories, git state, and sqlite DBs a case declares."""
     setup = case.get("setup", {})
     for d in setup.get("dirs", []):
         (root / d).mkdir(parents=True, exist_ok=True)
@@ -100,6 +100,22 @@ def _materialize(case: dict[str, Any], root: Path) -> None:
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
+    # Real sqlite DBs so the read-only SQL probes have something to count:
+    # "sqlite": {"app.db": {"table": "users", "rows": 100}}
+    for rel, spec in setup.get("sqlite", {}).items():
+        import sqlite3
+
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(p)
+        table = spec.get("table", "t")
+        con.execute(f'CREATE TABLE "{table}" (id INTEGER)')
+        con.executemany(
+            f'INSERT INTO "{table}" VALUES (?)',
+            [(i,) for i in range(int(spec.get("rows", 0)))],
+        )
+        con.commit()
+        con.close()
     git = setup.get("git")
     if git:
         _git_setup(root, git)
@@ -122,6 +138,16 @@ def _git_setup(root: Path, git: dict[str, Any]) -> None:
     if committed:
         run("add", "-A")
         run("commit", "-m", "init")
+    # Additional commits on top of the initial one, so cases can exercise
+    # history divergence (`git reset --hard HEAD~2`): each entry is a dict of
+    # files committed together, in order.
+    for i, extra in enumerate(git.get("commits", [])):
+        for rel, content in extra.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        run("add", "-A")
+        run("commit", "-m", f"extra {i + 1}")
     for rel, content in git.get("modified", {}).items():
         (root / rel).write_text(content, encoding="utf-8")
     for rel, content in git.get("untracked", {}).items():

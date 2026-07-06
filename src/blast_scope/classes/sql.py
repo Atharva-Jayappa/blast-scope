@@ -83,6 +83,14 @@ class SqlClass:
         table = _target_table(sql)
         transactional = _is_transactional(candidate.raw, sql)
 
+        if candidate.operation == "delete_scoped":
+            # Static analysis already called this benign; only a real count
+            # may say otherwise. No probe → stay silent (preserves the
+            # calibrated low for scoped deletes on unprobeable engines).
+            if engine != "sqlite" or not dbfile:
+                return None
+            return _assess_scoped_delete(cwd, dbfile, table, sql, transactional)
+
         available, exists, count = (False, None, None)
         if engine == "sqlite" and dbfile:
             available, exists, count = _sqlite_probe(cwd, dbfile, table)
@@ -127,10 +135,13 @@ def _classify_sql(sql: str) -> str | None:
         return "drop"
     if _TRUNCATE_RE.search(sql):
         return "truncate"
-    if _DELETE_RE.search(sql) and (
-        not _WHERE_RE.search(sql) or _MASS_WHERE_RE.search(sql)
-    ):
-        return "delete_all"
+    if _DELETE_RE.search(sql):
+        if not _WHERE_RE.search(sql) or _MASS_WHERE_RE.search(sql):
+            return "delete_all"
+        # WHERE-scoped DELETE: benign by static analysis, but when a read-only
+        # probe exists (sqlite) we can count exactly what it matches — a
+        # "scoped" delete hitting most of the table is a mass delete in a wig.
+        return "delete_scoped"
     return None
 
 
@@ -180,6 +191,81 @@ def _sqlite_probe(cwd: Path, dbfile: str, table: str) -> tuple[bool, bool | None
         return (True, None, None)
     finally:
         con.close()
+
+
+# WHERE-scoped DELETE → SELECT count(*) rewrite (single-table only).
+_SCOPED_DELETE_RE = re.compile(
+    r"^\s*DELETE\s+FROM\s+([`\"\[]?\w+[`\"\]]?)\s+(WHERE\b.*?)\s*;?\s*$",
+    re.I | re.S,
+)
+_LIMIT_RE = re.compile(r"\bLIMIT\s+(\d+)\s*$", re.I)
+
+
+def _assess_scoped_delete(
+    cwd: Path, dbfile: str, table: str, sql: str, transactional: bool
+) -> Consequence | None:
+    """Count exactly what a WHERE-scoped DELETE matches, via read-only SELECT.
+
+    ``DELETE FROM t WHERE p`` → ``SELECT count(*) FROM t WHERE p`` is exact
+    and pure-read for the single-table form. Multi-table/USING shapes are not
+    mechanically rewritable — the regex simply won't match them and we stay
+    silent. Never EXPLAIN ANALYZE (it executes the DELETE).
+    """
+    m = _SCOPED_DELETE_RE.match(sql)
+    if m is None or ";" in sql.rstrip().rstrip(";"):
+        return None  # multi-statement or non-simple shape — do not guess
+
+    where = m.group(2)
+    limit: int | None = None
+    lim = _LIMIT_RE.search(where)
+    if lim:
+        limit = int(lim.group(1))
+        where = where[: lim.start()].rstrip()
+
+    path = Path(dbfile)
+    if not path.is_absolute():
+        path = cwd / dbfile
+    if not path.is_file():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=_PROBE_TIMEOUT)
+    except sqlite3.Error:
+        return None
+    try:
+        row = con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if row is None:
+            return None
+        total = con.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0]
+        matched = con.execute(f'SELECT count(*) FROM "{table}" {where}').fetchone()[0]
+    except sqlite3.Error:
+        return None  # bad WHERE for a bare SELECT — let the real command fail
+    finally:
+        con.close()
+
+    if limit is not None:
+        matched = min(matched, limit)
+    if matched <= 0:
+        return Consequence(
+            "sql", 0.1, f"scoped DELETE on {table} matches 0 of {total} row(s) right now"
+        )
+
+    fraction = matched / total if total else 0.0
+    if transactional:
+        floor = 0.35
+    elif fraction >= 0.5 or matched >= 1000:
+        floor = 0.6  # a "scoped" delete removing most of the table is mass deletion
+    elif fraction >= 0.1 or matched >= 100:
+        floor = 0.4
+    else:
+        floor = 0.15  # genuinely scoped — stays low
+    return Consequence(
+        "sql",
+        floor,
+        f"scoped DELETE on {table} matches {matched} of {total} row(s) "
+        f"({fraction:.0%}) — counted read-only",
+    )
 
 
 # ---------------------------------------------------------------------------

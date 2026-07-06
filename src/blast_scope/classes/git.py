@@ -88,16 +88,21 @@ class GitClass:
         if base is None:
             return None
 
+        targets: tuple[str, ...] = ()
         if candidate.operation == "push_force":
             floor, evidence, estimated = _refine_push_force(base, cwd)
         elif candidate.operation == "branch_delete":
             floor, evidence, estimated = _refine_branch_delete(base, cwd, candidate)
         elif candidate.operation == "reset_hard":
-            floor, evidence, estimated = _annotate_reflog(base, cwd)
+            floor, evidence, estimated = _refine_reset(base, cwd, candidate)
+        elif candidate.operation == "clean_force":
+            floor, evidence, estimated, targets = _refine_clean(base, cwd, candidate)
+        elif candidate.operation == "discard_paths":
+            floor, evidence, estimated, targets = _refine_discard(base, cwd, candidate)
         else:
             floor, evidence, estimated = base.floor, base.evidence, False
 
-        return Consequence("vcs", floor, evidence, estimated=estimated)
+        return Consequence("vcs", floor, evidence, estimated=estimated, targets=targets)
 
 
 # ---------------------------------------------------------------------------
@@ -233,18 +238,273 @@ def _annotate_reflog(base: Consequence, cwd: Path) -> tuple[float, str, bool]:
     return base.floor, base.evidence, False
 
 
+# Floor for a reset that orphans committed history. Deliberately medium, not
+# high: the reflog keeps orphaned commits recoverable for the gc window
+# (~30-90 days by default) — the truly unrecoverable loss is the dirty
+# working tree, which the count-scaled base floor already covers.
+_RESET_DIVERGENCE_FLOOR = 0.45
+
+
+def _refine_reset(
+    base: Consequence, cwd: Path, candidate: Candidate
+) -> tuple[float, str, bool]:
+    """Refine ``reset --hard`` with the divergence to an explicit target ref.
+
+    ``git reset --hard`` (implicit HEAD) only discards uncommitted work — the
+    base floor covers it. ``git reset --hard origin/main`` *additionally*
+    orphans every commit in ``<ref>..HEAD``; we count them with a read-only
+    ``rev-list`` and floor at medium (reflog-recoverable, but not silently).
+    """
+    ref = _reset_operand(candidate.raw)
+    if ref is None:
+        return _annotate_reflog(base, cwd)
+
+    if _git_read(cwd, "rev-parse", "--verify", "--quiet", ref + "^{commit}") is None:
+        return base.floor, base.evidence + f" (target ref {ref} unverified)", True
+
+    orphaned_raw = _git_read(cwd, "rev-list", "--count", f"{ref}..HEAD")
+    try:
+        orphaned = int(orphaned_raw) if orphaned_raw is not None else 0
+    except ValueError:
+        orphaned = 0
+
+    if orphaned <= 0:
+        return (
+            base.floor,
+            base.evidence + f" — {ref} already contains HEAD, no commits orphaned",
+            False,
+        )
+
+    reflog = _has_reflog(cwd)
+    recover = (
+        "recoverable via `git reflog` for the gc window (~30-90 days)"
+        if reflog
+        else "and this repo has NO reflog — they would be unreferenced"
+    )
+    floor = max(base.floor, _RESET_DIVERGENCE_FLOOR if reflog else 0.6)
+    return (
+        floor,
+        f"reset --hard to {ref} orphans {orphaned} commit(s) — {recover}. "
+        + base.evidence,
+        False,
+    )
+
+
+def _refine_clean(
+    base: Consequence, cwd: Path, candidate: Candidate
+) -> tuple[float, str, bool, tuple[str, ...]]:
+    """Replace the untracked-count estimate with ``git clean -n``'s exact list.
+
+    The dry-run must mirror the real command's *selection* flags (``-d``,
+    ``-x``/``-X``, ``-e`` excludes, pathspec) and swap only the execute switch
+    (``-f`` → ``-n``) — dropping ``-x`` or ``-d`` would understate the blast
+    radius. ``git clean -n`` is a pure enumeration: no deletion, no index
+    write, no hooks.
+    """
+    probe = ["clean", "-n"]
+    selection, pathspec = _clean_selection(candidate.raw)
+    probe += selection + pathspec
+
+    out = _git_read(cwd, *probe)
+    if out is None:
+        return base.floor, base.evidence + " (dry-run unavailable)", True, ()
+
+    removed: list[str] = []
+    skipped_repos: list[str] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("Would remove "):
+            removed.append(line[len("Would remove ") :].rstrip("/"))
+        elif line.startswith("Would skip repository "):
+            skipped_repos.append(line[len("Would skip repository ") :].rstrip("/"))
+
+    if not removed and not skipped_repos:
+        return 0.0, "git clean dry-run: nothing to remove", False, ()
+
+    floor = min(0.9, 0.4 + 0.05 * len(removed)) if removed else base.floor
+    shown = ", ".join(removed[:6]) + ("…" if len(removed) > 6 else "")
+    evidence = (
+        f"git clean would permanently delete {len(removed)} path(s) "
+        f"(dry-run verified): {shown}"
+    )
+    if skipped_repos:
+        evidence += (
+            f" — plus {len(skipped_repos)} nested repo(s) skipped in the "
+            f"preview that `-ff` WOULD remove: {', '.join(skipped_repos[:3])}"
+        )
+        floor = max(floor, 0.7)  # a nested repo is its own recovery net
+    return floor, evidence, False, tuple(removed)
+
+
+def _refine_discard(
+    base: Consequence, cwd: Path, candidate: Candidate
+) -> tuple[float, str, bool, tuple[str, ...]]:
+    """Preview exactly which files a checkout/restore would clobber.
+
+    ``git diff --name-only`` is a pure read that lists the files whose local
+    content differs from what the checkout would write over them.
+    """
+    raw = candidate.raw
+    if "--theirs" in raw or "--ours" in raw:
+        out = _git_read(cwd, "diff", "--name-only", "--diff-filter=U")
+        if out is None:
+            return base.floor, base.evidence, True, ()
+        files = [l.strip() for l in out.splitlines() if l.strip()]
+        if not files:
+            return base.floor, base.evidence + " (no unmerged paths right now)", False, ()
+        side = "--theirs" if "--theirs" in raw else "--ours"
+        floor = max(base.floor, min(0.9, 0.4 + 0.05 * len(files)))
+        return (
+            floor,
+            f"checkout {side} overwrites the local side of {len(files)} "
+            f"conflicted file(s): {', '.join(files[:6])}",
+            False,
+            tuple(files),
+        )
+
+    # The unrecoverable loss is UNCOMMITTED work under the pathspec — committed
+    # differences vs the target ref just switch content and stay in history.
+    # `diff HEAD` (worktree+index vs last commit) enumerates exactly that loss.
+    _ref, pathspec = _checkout_operands(raw)
+    args = ["diff", "--name-only", "HEAD"]
+    if pathspec:
+        args.append("--")
+        args += pathspec
+    out = _git_read(cwd, *args)
+    if out is None:
+        return base.floor, base.evidence, True, ()
+    files = [l.strip() for l in out.splitlines() if l.strip()]
+    if not files:
+        return 0.0, "checkout/restore preview: no local changes would be clobbered", False, ()
+    floor = min(0.9, 0.4 + 0.05 * len(files))
+    return (
+        floor,
+        f"would discard uncommitted changes in {len(files)} file(s) "
+        f"(diff-verified): {', '.join(files[:6])}",
+        False,
+        tuple(files),
+    )
+
+
 def _branch_operand(raw: str) -> str | None:
     """Return the first non-flag operand after ``branch`` (the branch name)."""
+    after = _tokens_after(raw, "branch")
+    for tok in after:
+        if not tok.startswith("-"):
+            return tok
+    return None
+
+
+def _reset_operand(raw: str) -> str | None:
+    """Return the explicit target ref of a ``git reset``, or None for HEAD.
+
+    ``git reset --hard`` → None (implicit HEAD); ``git reset --hard
+    origin/main`` → ``origin/main``. A pathspec after ``--`` is not a ref.
+    """
+    after = _tokens_after(raw, "reset")
+    for tok in after:
+        if tok == "--":
+            break
+        if not tok.startswith("-"):
+            return tok
+    return None
+
+
+def _clean_selection(raw: str) -> tuple[list[str], list[str]]:
+    """Extract ``git clean``'s selection flags + pathspec, dropping force/quiet.
+
+    Returns ``(selection_flags, pathspec)`` where selection is rebuilt from
+    the original clusters: ``-fdx`` → ``['-d', '-x']``; ``-e PAT`` and
+    ``--exclude=PAT`` are carried verbatim.
+    """
+    after = _tokens_after(raw, "clean")
+    selection: list[str] = []
+    pathspec: list[str] = []
+    expect_exclude = False
+    seen_double_dash = False
+    for tok in after:
+        if expect_exclude:
+            selection += ["-e", tok]
+            expect_exclude = False
+            continue
+        if seen_double_dash:
+            pathspec.append(tok)
+            continue
+        if tok == "--":
+            seen_double_dash = True
+            continue
+        if tok == "-e" or tok == "--exclude":
+            expect_exclude = True
+            continue
+        if tok.startswith("--exclude="):
+            selection += ["-e", tok[len("--exclude=") :]]
+            continue
+        if tok.startswith("--"):
+            continue  # --force / --quiet / --dry-run — never mirrored
+        if tok.startswith("-"):
+            cluster = set(tok[1:])
+            if "d" in cluster:
+                selection.append("-d")
+            if "x" in cluster:
+                selection.append("-x")
+            if "X" in cluster:
+                selection.append("-X")
+            continue
+        pathspec.append(tok)
+    return selection, pathspec
+
+
+def _checkout_operands(raw: str) -> tuple[str | None, list[str]]:
+    """Split checkout/restore operands into ``(ref, pathspec)``.
+
+    ``git checkout main -- src/`` → ("main", ["src/"]);
+    ``git checkout -- a.py`` → (None, ["a.py"]); ``git checkout .`` → (None, ["."]).
+    """
+    matched_sub = None
+    after: list[str] = []
+    for sub in ("checkout", "restore", "switch"):
+        after = _tokens_after(raw, sub)
+        if after:
+            matched_sub = sub
+            break
+    if matched_sub is None:
+        return None, []
+    ref: str | None = None
+    pathspec: list[str] = []
+    seen_double_dash = False
+    for tok in after:
+        if tok == "--":
+            seen_double_dash = True
+            continue
+        if tok.startswith("--source="):
+            ref = tok[len("--source=") :]  # git restore names its ref this way
+            continue
+        if tok.startswith("-") and not seen_double_dash:
+            continue
+        # `git restore <paths>`: positionals are always paths, never refs.
+        if (
+            matched_sub == "restore"
+            or seen_double_dash
+            or tok == "."
+            or "/" in tok
+            or "*" in tok
+        ):
+            pathspec.append(tok)
+        elif ref is None:
+            ref = tok
+        else:
+            pathspec.append(tok)
+    return ref, pathspec
+
+
+def _tokens_after(raw: str, word: str) -> list[str]:
+    """Tokens following the first occurrence of ``word`` in ``raw``."""
     import shlex
 
     try:
         tokens = shlex.split(raw)
     except ValueError:
         tokens = raw.split()
-    if "branch" not in tokens:
-        return None
-    after = tokens[tokens.index("branch") + 1 :]
-    for tok in after:
-        if not tok.startswith("-"):
-            return tok
-    return None
+    if word not in tokens:
+        return []
+    return tokens[tokens.index(word) + 1 :]

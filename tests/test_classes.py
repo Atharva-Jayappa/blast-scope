@@ -167,3 +167,101 @@ class TestGatherClasses:
     def test_gather_never_raises_on_bad_input(self, tmp_path: Path) -> None:
         parsed = parse_command("git", cwd=tmp_path)
         assert gather_classes(parsed, "git", tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# Dry-run oracles (rung 2 tier 1)
+# ---------------------------------------------------------------------------
+
+
+class TestCleanOracle:
+    def test_clean_dry_run_lists_exact_files(self, repo: Path) -> None:
+        (repo / "junk1.tmp").write_text("a")
+        (repo / "junk2.tmp").write_text("b")
+        c = GitClass().assess(Candidate("git", "clean_force", "git clean -f"), repo)
+        assert c is not None
+        assert "dry-run verified" in c.evidence
+        names = set(c.targets)
+        assert {"junk1.tmp", "junk2.tmp", "untracked.py"} <= names
+        assert c.estimated is False
+
+    def test_clean_mirrors_d_flag(self, repo: Path) -> None:
+        d = repo / "scratch"
+        d.mkdir()
+        (d / "f.txt").write_text("x")
+        no_d = GitClass().assess(Candidate("git", "clean_force", "git clean -f"), repo)
+        with_d = GitClass().assess(Candidate("git", "clean_force", "git clean -fd"), repo)
+        assert no_d is not None and with_d is not None
+        assert not any("scratch" in t for t in no_d.targets)
+        assert any("scratch" in t for t in with_d.targets)
+
+    def test_clean_mirrors_x_flag(self, repo: Path) -> None:
+        (repo / ".gitignore").write_text("*.log\n")
+        _git(repo, "add", ".gitignore")
+        _git(repo, "commit", "-m", "ignore")
+        (repo / "build.log").write_text("x")
+        no_x = GitClass().assess(Candidate("git", "clean_force", "git clean -f"), repo)
+        with_x = GitClass().assess(Candidate("git", "clean_force", "git clean -fx"), repo)
+        assert no_x is not None and with_x is not None
+        assert "build.log" not in no_x.targets
+        assert "build.log" in with_x.targets
+
+    def test_clean_on_clean_tree_is_zero(self, repo: Path) -> None:
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", "all in")
+        c = GitClass().assess(Candidate("git", "clean_force", "git clean -fd"), repo)
+        assert c is not None
+        assert c.floor == 0.0
+        assert c.targets == ()
+
+
+class TestResetDivergenceOracle:
+    def test_explicit_ref_counts_orphans_reflog_recoverable(self, repo: Path) -> None:
+        _git(repo, "stash", "--include-untracked")  # clean the tree
+        _git(repo, "tag", "base")
+        (repo / "new1.py").write_text("1")
+        _git(repo, "add", "new1.py")
+        _git(repo, "commit", "-m", "c1")
+        (repo / "new2.py").write_text("2")
+        _git(repo, "add", "new2.py")
+        _git(repo, "commit", "-m", "c2")
+        c = GitClass().assess(
+            Candidate("git", "reset_hard", "git reset --hard base"), repo
+        )
+        assert c is not None
+        assert "orphans 2 commit(s)" in c.evidence
+        assert "reflog" in c.evidence
+        assert 0.45 <= c.floor < 0.8  # medium: reflog keeps them recoverable
+
+    def test_implicit_head_keeps_base_behavior(self, repo: Path) -> None:
+        c = GitClass().assess(Candidate("git", "reset_hard", "git reset --hard"), repo)
+        assert c is not None
+        assert "orphans" not in c.evidence  # no ref → divergence probe not run
+
+    def test_unknown_ref_degrades_to_estimate(self, repo: Path) -> None:
+        c = GitClass().assess(
+            Candidate("git", "reset_hard", "git reset --hard origin/nope"), repo
+        )
+        assert c is not None
+        assert c.estimated is True
+        assert "unverified" in c.evidence
+
+
+class TestDiscardOracle:
+    def test_checkout_paths_lists_dirty_files(self, repo: Path) -> None:
+        c = GitClass().assess(
+            Candidate("git", "discard_paths", "git checkout -- tracked.py"), repo
+        )
+        assert c is not None
+        assert c.targets == ("tracked.py",)
+        assert "diff-verified" in c.evidence
+
+    def test_checkout_clean_path_is_zero(self, repo: Path) -> None:
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", "all in")
+        c = GitClass().assess(
+            Candidate("git", "discard_paths", "git checkout -- tracked.py"), repo
+        )
+        assert c is not None
+        assert c.floor == 0.0
+        assert c.targets == ()

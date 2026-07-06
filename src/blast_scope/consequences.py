@@ -38,10 +38,16 @@ class Consequence:
                     evidence="git reset --hard would discard 4 modified file(s)")
     """
 
-    domain: str  # "vcs" | "infra" | "config" | "docker" | "packages" | "sql"
+    domain: str  # "vcs" | "infra" | "config" | "docker" | "packages" | "sql" | "resolution"
     floor: float  # minimum score this consequence justifies, 0.0 - 1.0
     evidence: str  # human-readable explanation
     estimated: bool = False  # True when derived from a heuristic, not a live probe
+    # Exact paths a dry-run oracle discovered the command would destroy
+    # (git clean -n / find -print / rsync -n). Empty for estimate-based
+    # consequences. Feeds the recoverability axis, the mass-destruction gate,
+    # and the hook's undo snapshot — the statically-parsed targets for these
+    # commands are useless ("." or a glob token).
+    targets: tuple[str, ...] = ()
 
 
 def gather(
@@ -87,4 +93,30 @@ def gather(
         if config_c is not None:
             out.append(config_c)
 
+    clobber_c = _copy_clobber(parsed)
+    if clobber_c is not None:
+        out.append(clobber_c)
+
     return out
+
+
+def _copy_clobber(parsed: ParsedCommand) -> Consequence | None:
+    """Evidence when ``cp``/``mv`` would overwrite an existing file (pure stat).
+
+    The destination is already in ``targets``, so recoverability scores it —
+    this just makes the overwrite explicit in the advisory instead of leaving
+    it implied by a path list.
+    """
+    if parsed.get("command") not in ("cp", "mv") or len(parsed["targets"]) < 2:
+        return None
+    dst = Path(parsed["targets"][-1])
+    try:
+        if not dst.is_file():
+            return None
+    except OSError:
+        return None
+    return Consequence(
+        "fs",
+        0.0,  # evidence only: the dst's own recoverability drives the score
+        f"destination {dst.name} already exists — its current content is overwritten",
+    )

@@ -159,7 +159,6 @@ class TestSqlTriage:
     @pytest.mark.parametrize(
         "raw",
         [
-            'psql -c "DELETE FROM logs WHERE id = 1"',  # has WHERE → benign
             'psql -c "SELECT * FROM users"',
             'mysql -e "INSERT INTO t VALUES (1)"',
             "ls -la",
@@ -167,6 +166,15 @@ class TestSqlTriage:
     )
     def test_benign_is_silent(self, raw: str, tmp_path: Path) -> None:
         assert _cand(SqlClass(), raw, tmp_path) is None
+
+    def test_scoped_delete_triages_but_silent_without_probe(self, tmp_path: Path) -> None:
+        # A WHERE-scoped DELETE now triages (so the sqlite oracle can count
+        # it), but assess stays silent on unprobeable engines — end behavior
+        # for postgres/mysql is unchanged.
+        raw = 'psql -c "DELETE FROM logs WHERE id = 1"'
+        c = _cand(SqlClass(), raw, tmp_path)
+        assert c is not None and c.operation == "delete_scoped"
+        assert SqlClass().assess(c, tmp_path) is None
 
 
 class TestSqlAssess:
@@ -212,3 +220,51 @@ class TestSqlAssess:
             tmp_path,
         )
         assert c is not None and 0.5 <= c.floor < 0.85
+
+
+class TestScopedDeleteOracle:
+    def _cand_scoped(self, sql: str) -> Candidate:
+        return Candidate(
+            "sql", "delete_scoped", f'sqlite3 app.db "{sql}"', ("sqlite", "app.db")
+        )
+
+    def test_small_scoped_delete_stays_low(self, tmp_path: Path) -> None:
+        _make_sqlite(tmp_path / "app.db", rows=100)
+        c = SqlClass().assess(self._cand_scoped("DELETE FROM users WHERE id = 5"), tmp_path)
+        assert c is not None
+        assert c.floor <= 0.15
+        assert "1 of 100" in c.evidence
+
+    def test_mass_fraction_scoped_delete_escalates(self, tmp_path: Path) -> None:
+        _make_sqlite(tmp_path / "app.db", rows=100)
+        c = SqlClass().assess(self._cand_scoped("DELETE FROM users WHERE id >= 10"), tmp_path)
+        assert c is not None
+        assert c.floor >= 0.6  # 90% of the table is a mass delete in a wig
+        assert "90 of 100" in c.evidence
+
+    def test_limit_caps_the_count(self, tmp_path: Path) -> None:
+        _make_sqlite(tmp_path / "app.db", rows=100)
+        c = SqlClass().assess(
+            self._cand_scoped("DELETE FROM users WHERE id >= 0 LIMIT 3"), tmp_path
+        )
+        assert c is not None
+        assert "3 of 100" in c.evidence
+        assert c.floor <= 0.15
+
+    def test_zero_matches_is_low(self, tmp_path: Path) -> None:
+        _make_sqlite(tmp_path / "app.db", rows=10)
+        c = SqlClass().assess(self._cand_scoped("DELETE FROM users WHERE id > 999"), tmp_path)
+        assert c is not None
+        assert c.floor <= 0.1
+        assert "matches 0" in c.evidence
+
+    def test_missing_db_stays_silent(self, tmp_path: Path) -> None:
+        c = SqlClass().assess(self._cand_scoped("DELETE FROM users WHERE id = 1"), tmp_path)
+        assert c is None
+
+    def test_bad_where_stays_silent(self, tmp_path: Path) -> None:
+        _make_sqlite(tmp_path / "app.db", rows=10)
+        c = SqlClass().assess(
+            self._cand_scoped("DELETE FROM users WHERE nonexistent_col = 1"), tmp_path
+        )
+        assert c is None  # the real command would fail the same way

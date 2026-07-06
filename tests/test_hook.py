@@ -115,3 +115,40 @@ class TestRun:
         assert snaps
         snapshot.restore_snapshot(snaps[0]["id"], root=tmp_path)
         assert target.read_text() == "{\"k\": \"v\"}"
+
+
+class TestOracleSnapshot:
+    """Oracle-discovered targets flow into the undo snapshot (rung 2)."""
+
+    def test_git_clean_snapshots_oracle_targets(self, tmp_path: Path) -> None:
+        import subprocess
+
+        def g(*a: str) -> None:
+            subprocess.run(["git", "-C", str(tmp_path), *a], capture_output=True)
+
+        g("init")
+        g("config", "user.email", "t@t.t")
+        g("config", "user.name", "t")
+        (tmp_path / "app.py").write_text("x = 1\n")
+        g("add", "-A")
+        g("commit", "-m", "init")
+        # Untracked secret: `git clean -fdx` would delete it permanently. Its
+        # path appears NOWHERE in the command — only the dry-run oracle can
+        # discover it, and only the oracle-fed snapshot can save it.
+        (tmp_path / ".env").write_text("KEY=irreplaceable\n")
+
+        out = hook.run(_payload("git clean -fdx", tmp_path))
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        assert "CRITICAL" in ctx
+        assert ".env" in ctx
+
+        snaps = snapshot.list_snapshots(tmp_path)
+        assert len(snaps) == 1
+        archived = {Path(e["original"]).name for e in snaps[0]["entries"]}
+        assert ".env" in archived
+
+        # Simulate the deletion, then restore — the undo net works.
+        (tmp_path / ".env").unlink()
+        restored = snapshot.restore_snapshot(snaps[0]["id"], root=tmp_path)
+        assert any(p.endswith(".env") for p in restored)
+        assert (tmp_path / ".env").read_text() == "KEY=irreplaceable\n"

@@ -229,6 +229,37 @@ def assess(
         if extra:
             consequences_per_command[0] = list(consequences_per_command[0] or []) + extra
 
+    # Dry-run oracle targets: when an analyzer *observed* the exact paths a
+    # command destroys (git clean -n, find -print, rsync -n), merge them into
+    # the step's parsed targets before scoring. One merge point and every
+    # downstream consumer sees the real victims: worst-case recoverability
+    # re-classifies them, the mass-destruction gate counts real source files,
+    # and the hook's undo snapshot archives them (it reads the chain step's
+    # parsed targets — which for `git clean .`/`find -delete` are otherwise
+    # just "." or a glob token).
+    for i, cons in enumerate(consequences_per_command):
+        oracle_targets: list[str] = []
+        for c in cons or []:
+            for t in c.targets:
+                p = Path(t)
+                if not p.is_absolute():
+                    p = Path(working_dir, t)
+                try:
+                    oracle_targets.append(str(p.resolve()))
+                except OSError:
+                    oracle_targets.append(str(p))
+        if not oracle_targets:
+            continue
+        merged = dict(parsed_list[i])
+        merged["targets"] = list(merged["targets"]) + oracle_targets
+        merged["write_targets"] = (
+            list(merged.get("write_targets") or []) + oracle_targets
+        )
+        parsed_list[i] = merged  # type: ignore[assignment]
+        recoverability_per_command[i] = _worst_recoverability(
+            merged["write_targets"]
+        )
+
     assessment = score_chain(
         parsed_list,
         resolutions_per_command,

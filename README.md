@@ -107,6 +107,7 @@ in [`src/blast_scope/classes/`](src/blast_scope/classes); each class confines
 |---|---|
 | Flag/operand-sensitive command model (POSIX **and** PowerShell) | `command_effects.py`, `command_parser.py` |
 | **Command resolution** — env/tilde/brace/glob expansion, unset-var hazards, script transparency (`sh -c`, `npm run` + pre/post hooks, script files, Makefile targets), read-only `$(...)` substitution | `resolution.py` |
+| **Dry-run oracles** — `git clean -n` exact lists, reset divergence, checkout clobber preview, `find -delete`→`-print` rewrite, sqlite scoped-DELETE counts, rsync `--dry-run`; oracle targets feed the undo snapshot | `classes/git.py`, `classes/find.py`, `classes/rsync.py`, `classes/sql.py` |
 | Recoverability classification (git state, secrets, regenerable, precious data) | `recoverability.py` |
 | Dependency graph + weighted **PageRank** centrality, incremental indexing | `graph_resolver.py`, `centrality.py` |
 | Two-axis, evidence-based filesystem scoring | `risk_scorer.py` |
@@ -117,12 +118,12 @@ in [`src/blast_scope/classes/`](src/blast_scope/classes); each class confines
 
 **Calibration.** Two harnesses, both run-it-yourself:
 
-- **In-repo corpus** (`tests/fixtures/eval_corpus.jsonl`, 54 cases spanning every
+- **In-repo corpus** (`tests/fixtures/eval_corpus.jsonl`, 58 cases spanning every
   recoverability category, git working-tree state, infra/config, `rm -rf .git`,
   a graph-indexed central module, the git/docker/pip/SQL classes, and the
   resolution layer — unset-var collapses, glob/env-var targets, `sh -c`
   payloads, npm pre-hooks, opaque wrappers, mass destruction of tracked
-  source) — **54/54 exact severity, gate F1 1.00**, pinned by
+  source) — **58/58 exact severity, gate F1 1.00**, pinned by
   `tests/test_eval.py` with headroom so changes can't silently regress.
 - **[SABER](https://github.com/sssr-lab/saber)** — 716 real coding-agent
   workspaces. Against ~1725 safe commands, blast-scope's **false-positive rate is

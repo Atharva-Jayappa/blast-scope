@@ -187,6 +187,37 @@ Path-tied `infra`/`config` still apply before the caps.
 labeled estimate → (triage error) silent. Analysis is advisory and must never
 block or delay a command on failure.
 
+## Dry-run oracles — observe, don't predict
+
+For a class of destructive commands the tool itself can be asked, side-effect-
+free, exactly what would be destroyed. Oracles replace count-based estimates
+with **exact target lists**, which flow through one channel
+(`Consequence.targets`) into three consumers at once: worst-case
+recoverability re-classifies the real victims, the mass-destruction gate
+counts real source files, and the **hook's undo snapshot archives them** —
+files whose paths appear nowhere in the command text.
+
+| Command | Oracle (verified side-effect-free) | Output |
+|---|---|---|
+| `git clean -f[dxX]` | `git clean -n` + mirrored selection flags (`-d`/`-x`/`-X`/`-e`/pathspec — dropping one understates) | exact `Would remove` list; nested-repo skips flagged (real `-ff` removes more) |
+| `git reset --hard <ref>` | `git rev-list --count <ref>..HEAD` | orphaned-commit count; floor 0.45 (reflog keeps them ~30–90 d) or 0.6 with no reflog; dirty-tree scaling unchanged — uncommitted work is the real loss |
+| `git checkout/restore` paths | `git diff --name-only HEAD [-- paths]` | exact dirty files clobbered (committed diffs just switch — not loss) |
+| `find … -delete` / `-exec rm` | faithful `-print` rewrite: terminal replaced **in place** + `-depth` added (`-delete` implies it; `-prune` diverges without it); `-o` / multi-terminal → punt to static | exact match set; `rm -r` payloads flagged as subtree roots |
+| `sqlite3 db "DELETE … WHERE p"` | `SELECT count(*) FROM t WHERE p` on the `mode=ro` connection (single-table only; `LIMIT n` capped) | matched/total: <10 % stays low, ≥50 % or ≥1000 rows floors 0.6 — a "scoped" delete removing most of the table is a mass delete in a wig |
+| `rsync --delete` (local↔local) | real flags + `--dry-run --itemize-changes` (man page guarantees parity with the real run); remote endpoints → estimate, never probed | `*deleting` lines |
+| `cp`/`mv` over existing file | pure `stat` of the destination | overwrite made explicit in evidence |
+
+**Verified UNSAFE as probes — never used:** `make -n` (`$(shell)` runs at
+parse), `npm --dry-run` (lifecycle scripts + network), `EXPLAIN ANALYZE` on a
+DELETE (executes it), `BEGIN…ROLLBACK` (transient mutation), `chmod
+--changes`/`cp -n`/`mv -n` (execution-time reporters, not previews), any
+user-defined git alias (may expand to `!sh -c …`).
+
+Degradation contract unchanged: probe unavailable (no rsync on stock Windows,
+Windows `find.exe` being a string-search tool, missing ref) → labeled
+estimate or silent fallback to the static classification. A failing probe
+never blocks and never scores lower than not probing.
+
 ## Severity & recommendation
 
 | score      | severity  | recommendation |
@@ -200,7 +231,7 @@ block or delay a command on failure.
 
 ## Calibration
 
-`eval.py` runs the labeled corpus (`tests/fixtures/eval_corpus.jsonl`, 54 cases
+`eval.py` runs the labeled corpus (`tests/fixtures/eval_corpus.jsonl`, 58 cases
 spanning every recoverability category — including `repo_history` (`rm -rf .git`)
 and a tracked-file control — git clean-vs-dirty state, infra/config files, a
 graph-indexed central module, the git/docker/pip/SQL classes including
@@ -216,7 +247,7 @@ then scored with the real `assess()`. It reports:
 
 Run it: `python -m blast_scope.eval`.
 
-**Current calibration:** 54/54 exact, 54/54 within-one-band, gate F1 1.00.
+**Current calibration:** 58/58 exact, 58/58 within-one-band, gate F1 1.00.
 `tests/test_eval.py` pins these with headroom (exact ≥ 0.85, within ≥ 0.95,
 F1 ≥ 0.9, and no critical-labeled command ever scored `proceed`) so future
 tuning can't silently regress.

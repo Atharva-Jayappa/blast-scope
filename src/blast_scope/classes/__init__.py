@@ -78,11 +78,20 @@ def registry() -> list[ConsequenceClass]:
     shell out are only loaded when consequence analysis actually runs.
     """
     from blast_scope.classes.docker import DockerClass
+    from blast_scope.classes.find import FindClass
     from blast_scope.classes.git import GitClass
     from blast_scope.classes.packages import PackagesClass
+    from blast_scope.classes.rsync import RsyncClass
     from blast_scope.classes.sql import SqlClass
 
-    return [GitClass(), DockerClass(), PackagesClass(), SqlClass()]
+    return [
+        GitClass(),
+        DockerClass(),
+        PackagesClass(),
+        SqlClass(),
+        FindClass(),
+        RsyncClass(),
+    ]
 
 
 def gather_classes(parsed: ParsedCommand, raw: str, cwd: Path | str) -> list[Consequence]:
