@@ -1,12 +1,13 @@
 {
   "name": "blast-scope",
+  "description": "Contextual blast-radius scoring for shell commands before an AI agent runs them — resolution-aware, graph-grounded, advisory-only.",
   "owner": { "name": "Atharva Jayappa", "url": "https://github.com/Atharva-Jayappa" },
   "plugins": [
     {
       "name": "blast-scope",
       "source": "./",
       "description": "Contextual blast-radius scoring for shell commands — an advisory PreToolUse guardrail plus MCP tools (assess / snapshots / restore).",
-      "version": "0.3.0",
+      "version": "0.4.1",
       "category": "security"
     }
   ]
