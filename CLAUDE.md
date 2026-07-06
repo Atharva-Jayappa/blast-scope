@@ -98,6 +98,19 @@ score formula (v1, iterate as real data comes in):
  
 ---
  
+## how to work
+
+behavioral guardrails. they bias toward caution over speed — for trivial changes, use judgment.
+
+- **think before coding.** state assumptions explicitly; if uncertain, ask. if a request reads more than one way, surface the options — don't pick silently. if there's a simpler approach, say so and push back when warranted. if something's unclear, stop and name it before writing code.
+- **simplicity first.** the minimum code that solves the problem, nothing speculative — no features beyond what was asked, no abstraction for single-use code, no configurability nobody requested, no error handling for impossible states. if you wrote 200 lines and 50 would do, rewrite it. the test: would a senior engineer call this overcomplicated?
+- **surgical changes.** touch only what the request needs. don't "improve" adjacent code, comments, or formatting; don't refactor what isn't broken; match existing style even if you'd do it differently. remove only the imports/vars/functions *your* change orphaned — leave pre-existing dead code alone (mention it, don't delete it). every changed line should trace to the request.
+- **goal-driven execution.** turn a task into a verifiable goal before coding: "add validation" → "write tests for the invalid inputs, then make them pass"; "fix the bug" → "write a failing test that reproduces it, then make it pass". the machinery already exists — `python -m blast_scope.eval` (the labeled corpus) and the pytest suite are the success criteria; a change isn't done until both are green. for multi-step work, state a short plan with a verify step per item.
+
+working if: fewer stray diffs, fewer rewrites from overcomplication, and questions land before the mistake, not after.
+
+---
+
 ## dependencies
  
 - `mcp` — MCP server SDK
