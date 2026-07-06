@@ -200,11 +200,16 @@ class TestRealSandbox:
         assert (tmp_path / "existing.txt").read_text() == "v1"
         assert not (tmp_path / "created.txt").exists()
 
-    def test_recursive_delete_lists_tree(self, tmp_path: Path) -> None:
+    def test_recursive_delete_reports_directory(self, tmp_path: Path) -> None:
+        # Deleting a directory that exists in the lower layer records ONE
+        # whiteout for the directory itself — overlayfs does not write a
+        # whiteout per child (the children live untouched in the lower layer,
+        # just shadowed). So the observed deletion is the directory `src`;
+        # downstream recoverability + snapshot walk that directory from there.
         (tmp_path / "src").mkdir()
         (tmp_path / "src" / "a.py").write_text("x")
         (tmp_path / "src" / "b.py").write_text("y")
         result = speculate.speculate("rm -rf src", tmp_path)
         assert result.ran
-        assert any("a.py" in d for d in result.deleted)
+        assert "src" in result.deleted
         assert (tmp_path / "src" / "a.py").exists()  # real tree intact
