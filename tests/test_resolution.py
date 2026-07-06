@@ -360,11 +360,13 @@ class TestEndToEnd:
         result = assess("sh -c 'rm -rf /'", cwd=str(tmp_path), env={})
         assert result["severity"] == "critical"
 
-    def test_destructive_python_c_floors_at_medium(self, tmp_path: Path) -> None:
+    def test_destructive_python_c_floors_at_high(self, tmp_path: Path) -> None:
+        # An opaque one-liner that names a destructive/exec token must reach the
+        # advise threshold (high) — medium would keep the hook silent.
         result = assess(
             "python -c 'import os; os.system(\"rm -rf /\")'", cwd=str(tmp_path), env={}
         )
-        assert result["severity"] == "medium"
+        assert result["severity"] == "high"
 
     def test_benign_python_c_stays_low(self, tmp_path: Path) -> None:
         result = assess("python3 -c 'import sqlite3'", cwd=str(tmp_path), env={})

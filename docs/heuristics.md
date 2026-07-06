@@ -55,13 +55,21 @@ score lower than seeing inside and finding it harmless.*
 ### Read-only command substitution
 
 `rm -rf $(find . -name '*.log')` names its targets through an inner command's
-output. When that inner command is **provably read-only** — deny-by-default
-allowlist checking verb *and* flags (`find` without `-delete/-exec`, `ls`,
-`git ls-files/rev-parse/describe`, `cat`, `echo`, …), no metacharacters, no
-nesting — the resolver runs *just it* (2 s timeout) and substitutes its output,
-exactly like the git/docker/SQL read-only probes. Anything else stays
-unexecuted; on a destructive verb the invisible target list becomes an
-`unresolved_substitution` floor of **0.35**.
+output. When that inner command is **provably a target-list producer** —
+deny-by-default allowlist checking verb *and* flags (`find` without
+`-delete/-exec`, `ls`, `git ls-files/rev-parse/describe`, `basename`, `echo`,
+…), no metacharacters or control chars, no nesting, and **every path argument
+inside the working tree** — the resolver runs *just it* (2 s timeout) and
+substitutes its output. Anything else stays unexecuted; on a destructive verb
+the invisible target list becomes an `unresolved_substitution` floor of
+**0.35**.
+
+Deliberately **not** on the allowlist: any command that reads file *content*
+(`cat`/`head`/`tail`/`wc`) or reveals paths outside the tree (`realpath`,
+`ls /etc`, `find /`). "Read-only" is not the same as "safe to run during
+analysis" — reading a secret *is* the harm. Allowing `cat` once made
+`rm -rf $(cat ~/.aws/credentials)` read the file and surface its contents
+during scoring; the allowlist expands target lists, never discloses bytes.
 
 ## The two-axis model
 

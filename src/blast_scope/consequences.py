@@ -84,14 +84,18 @@ def gather(
     # each triages cheaply, then probes only flagged destructive candidates.
     out.extend(gather_classes(parsed, raw, cwd))
 
-    for target in parsed["targets"]:
-        path = Path(target)
-        infra_c = infra.classify_infra(path)
-        if infra_c is not None:
-            out.append(infra_c)
-        config_c = config_refs.analyze_config_refs(path, project_root)
-        if config_c is not None:
-            out.append(config_c)
+    # Path-tied infra/config floors only ever apply to a non-read command
+    # (their floor gates on destructive intent downstream). Skipping the scan
+    # for reads avoids a full source-tree walk on `cat config.yaml`.
+    if parsed["intent"] != "read":
+        for target in parsed["targets"]:
+            path = Path(target)
+            infra_c = infra.classify_infra(path)
+            if infra_c is not None:
+                out.append(infra_c)
+            config_c = config_refs.analyze_config_refs(path, project_root)
+            if config_c is not None:
+                out.append(config_c)
 
     clobber_c = _copy_clobber(parsed)
     if clobber_c is not None:

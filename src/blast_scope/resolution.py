@@ -170,7 +170,12 @@ def resolve_segment(
     changed = False
 
     words = _scan(segment)
-    destructive_verb = bool(words) and words[0].text() in _DESTRUCTIVE_VERBS
+    # Peel wrappers/assignments (`sudo rm`, `env rm`, `FOO=1 rm`) so the
+    # unresolved-substitution hazard on a genuine deletion still fires — the
+    # verb behind a wrapper must not hide it.
+    from blast_scope.command_parser import real_command_verb
+
+    destructive_verb = real_command_verb(segment) in _DESTRUCTIVE_VERBS
 
     home = _home_dir(env_map)
     out_words: list[_Word] = []
@@ -604,17 +609,26 @@ _DESTRUCTIVE_VERBS = frozenset(
     {"rm", "shred", "rmdir", "unlink", "mv", "dd", "truncate"}
 )
 
+# Substitution verbs that never read file *content* — they print their string
+# args, list names, or report the environment. File-content readers
+# (`cat`/`head`/`tail`/`wc`) and path revealers (`realpath`/`readlink`) are
+# DELIBERATELY excluded: the use case is "expand a target list" (via
+# `ls`/`find`/`git ls-files`), never "read a file". Allowing `cat` turned this
+# into a read-any-file exfiltration channel — `rm -rf $(cat ~/.aws/credentials)`
+# would execute `cat` during *analysis* and surface the contents.
 _SAFE_SUBSTITUTION_VERBS = frozenset(
-    {
-        "ls", "echo", "printf", "cat", "basename", "dirname", "date", "pwd",
-        "which", "whoami", "head", "tail", "wc", "realpath", "readlink",
-    }
+    {"ls", "echo", "printf", "basename", "dirname", "date", "pwd", "which", "whoami"}
 )
+# Verbs that touch the filesystem by path — their path arguments must stay
+# inside the working tree, so a substitution can't enumerate `/etc` or `~/.ssh`.
+_FS_READING_VERBS = frozenset({"ls", "find", "git"})
 _FORBIDDEN_FIND_FLAGS = frozenset(
     {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint", "-fprintf"}
 )
 _SAFE_GIT_SUBCOMMANDS = frozenset({"ls-files", "rev-parse", "describe"})
-_INNER_METACHARS = re.compile(r"[|;&<>`]|\$\(")
+# Reject shell metacharacters AND control characters (a newline would let
+# `$(ls\ncat /etc/passwd)` slip a second argv past this filter).
+_INNER_METACHARS = re.compile(r"[|;&<>`\n\r]|\$\(")
 _SUBSTITUTION_TIMEOUT_S = 2
 _MAX_SUBSTITUTION_BYTES = 4096
 _UNRESOLVED_SUBSTITUTION_FLOOR = 0.35
@@ -682,8 +696,10 @@ def _execute_readonly(inner: str, cwd: Path) -> str | None:
     """Run an inner substitution command iff it is provably read-only.
 
     Returns its stdout (size-capped), or ``None`` when the command is not
-    allowlisted, contains metacharacters, fails, or times out. The analyzed
-    OUTER command is never executed here.
+    allowlisted, contains metacharacters, reaches outside the working tree, or
+    fails/times out. The analyzed OUTER command is never executed here, and no
+    command that reads file *content* is on the allowlist — so this can expand
+    a target list but never disclose a file's bytes.
     """
     if not inner or _INNER_METACHARS.search(inner):
         return None
@@ -702,6 +718,17 @@ def _execute_readonly(inner: str, cwd: Path) -> str | None:
             return None
     elif verb not in _SAFE_SUBSTITUTION_VERBS:
         return None
+
+    # Filesystem-reading verbs must stay inside the working tree — otherwise a
+    # substitution enumerates arbitrary paths (`ls /etc`, `find / -name id_rsa`).
+    if verb in _FS_READING_VERBS:
+        try:
+            cwd_res = cwd.resolve()
+        except OSError:
+            return None
+        if any(_path_escapes_cwd(t, cwd_res) for t in tokens[1:]):
+            return None
+
     try:
         proc = subprocess.run(
             tokens,
@@ -715,6 +742,26 @@ def _execute_readonly(inner: str, cwd: Path) -> str | None:
     if proc.returncode != 0:
         return None
     return proc.stdout.strip()[:_MAX_SUBSTITUTION_BYTES]
+
+
+def _path_escapes_cwd(token: str, cwd_res: Path) -> bool:
+    """True if a non-flag token resolves to a path outside the working tree.
+
+    Flags (leading ``-``), git refs, and glob patterns that resolve within cwd
+    are fine; an absolute path or ``../`` escape is not.
+    """
+    if token.startswith("-") or token in ("HEAD", "@"):
+        return False
+    p = Path(token)
+    try:
+        resolved = p.resolve() if (p.is_absolute() or token.startswith("/")) else (cwd_res / token).resolve()
+    except OSError:
+        return True
+    try:
+        resolved.relative_to(cwd_res)
+        return False
+    except ValueError:
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -869,6 +916,9 @@ _OPAQUE_EVAL_FLAGS: dict[str, frozenset[str]] = {
     "php": frozenset({"-r"}),
 }
 _OPAQUE_FLOOR = 0.35
+# An opaque one-liner that names a destructive/exec token floors HIGH (advises)
+# rather than medium (silent).
+_INLINE_DANGER_FLOOR = 0.5
 _PIPE_TO_SHELL_FLOOR = 0.5
 
 # State-changing capabilities inside interpreter one-liners. A `python -c`
@@ -998,10 +1048,15 @@ def _expand_one_wrapper(
         # the payload: floor only when it names a state-changing capability.
         payload = " ".join(a for a in args if not a.startswith("-"))
         if _INLINE_DANGER.search(payload):
+            # An interpreter one-liner that explicitly names a destructive/exec
+            # capability floors at HIGH so the hook actually surfaces it — a
+            # medium floor stays silent, letting `python -c "shutil.rmtree(...)"`
+            # slip past unremarked. (Obfuscation that hides the token from this
+            # regex is unanalyzable statically — that is what speculation is for.)
             hazards.append(
                 Hazard(
                     kind="opaque_wrapper",
-                    floor=_OPAQUE_FLOOR,
+                    floor=_INLINE_DANGER_FLOOR,
                     detail=(
                         f"{base} inline code names destructive/exec capability "
                         "— effects not statically visible"

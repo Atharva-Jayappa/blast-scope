@@ -61,6 +61,9 @@ _SUBSHELL_PATTERN: re.Pattern[str] = re.compile(r"\$\(|`")
 
 # Redirect operators
 _REDIRECT_PATTERN: re.Pattern[str] = re.compile(r"(\d*)(>>?)")
+# File-descriptor duplication (`2>&1`, `>&2`, `1>&2`, `2>&-`): a stream wiring,
+# not a file write. Must not be read as a truncating redirect.
+_FD_DUP_PATTERN: re.Pattern[str] = re.compile(r"^\d*>&(?:\d+|-)$")
 
 # Chain operators in priority order (longer matches first)
 _CHAIN_OPERATORS: tuple[str, ...] = ("&&", "||", ";", "|")
@@ -130,20 +133,13 @@ def parse_command(
     if not tokens:
         return _empty_result()
 
-    # Skip sudo prefix
-    idx = 0
-    if tokens[idx] == "sudo":
-        idx += 1
-        # Skip sudo flags. Some flags take an argument (-u USER, -g GROUP, -C fd).
-        _SUDO_ARG_FLAGS = frozenset({"-u", "-g", "-C", "-D", "-R", "-T", "-h", "--user", "--group"})
-        while idx < len(tokens) and tokens[idx].startswith("-"):
-            flag = tokens[idx]
-            idx += 1
-            # If this flag takes an argument, skip the next token too
-            if flag in _SUDO_ARG_FLAGS and idx < len(tokens):
-                idx += 1
-        if idx >= len(tokens):
-            return _empty_result()
+    # Peel transparent prefixes so the REAL command is classified, not the
+    # wrapper. `FOO=1 rm -rf /` and `env rm -rf /` must score like `rm -rf /`;
+    # leaving the verb as `FOO=1`/`env` collapsed intent to unknown and bypassed
+    # every floor (the widest scorer-evasion the audit found).
+    idx = _strip_prefixes(tokens)
+    if idx >= len(tokens):
+        return _empty_result()
 
     # Canonicalize PowerShell/cmd verbs (Remove-Item → rm) so the rest of the
     # pipeline is shell-agnostic.
@@ -398,6 +394,99 @@ def parse_chain_with_segments(
 # ---------------------------------------------------------------------------
 
 
+# Assignment prefix: FOO=1, PYTHONPATH=/x, etc.
+_ASSIGNMENT_RE: re.Pattern[str] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# Transparent exec-wrappers: they run the command that follows, so the real
+# verb is behind them. Peeled the same way as sudo so a destructive command
+# can't hide behind `env`/`timeout`/`xargs`/…
+_EXEC_WRAPPERS: frozenset[str] = frozenset(
+    {
+        "sudo", "env", "nohup", "nice", "command", "busybox", "time",
+        "stdbuf", "ionice", "setsid", "chrt", "xargs", "timeout", "doas",
+    }
+)
+# Wrapper flags that consume the following token as their argument.
+_WRAPPER_ARG_FLAGS: frozenset[str] = frozenset(
+    {
+        "-u", "-g", "-C", "-D", "-R", "-T", "-h", "--user", "--group",  # sudo
+        "-s", "-k", "--signal", "--kill-after",                          # timeout
+        "-n", "-P", "-I", "-i", "-d", "-c", "-o", "-e",                  # nice/xargs/ionice/stdbuf
+    }
+)
+# Wrappers that take one bare positional before the command (timeout DURATION).
+_WRAPPER_LEADING_POSITIONALS: dict[str, int] = {"timeout": 1}
+
+
+def _strip_prefixes(tokens: list[str]) -> int:
+    """Return the index of the real command after peeling wrappers/assignments.
+
+    Handles ``VAR=value`` assignment prefixes and transparent exec-wrappers
+    (``sudo``, ``env``, ``timeout``, ``nohup``, ``nice``, ``xargs``, …),
+    including their flags and flag-arguments — recursively, so ``sudo env
+    FOO=1 rm`` resolves to ``rm``.
+
+    Example::
+
+        >>> _strip_prefixes(["FOO=1", "rm", "-rf", "/"])
+        1
+        >>> _strip_prefixes(["timeout", "60", "rm", "-rf", "src"])
+        2
+    """
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if _ASSIGNMENT_RE.match(tok):
+            idx += 1
+            continue
+        base = tok.rsplit("/", 1)[-1]  # /usr/bin/env → env
+        if base not in _EXEC_WRAPPERS:
+            break  # this is the real command
+        idx += 1
+        positionals_to_skip = _WRAPPER_LEADING_POSITIONALS.get(base, 0)
+        while idx < len(tokens):
+            t = tokens[idx]
+            if t == "--":
+                idx += 1
+                break
+            if base == "env" and _ASSIGNMENT_RE.match(t):
+                idx += 1
+                continue
+            if t.startswith("-"):
+                idx += 1
+                if t in _WRAPPER_ARG_FLAGS and idx < len(tokens):
+                    idx += 1
+                continue
+            if positionals_to_skip > 0:
+                positionals_to_skip -= 1
+                idx += 1
+                continue
+            break  # first bare positional is the wrapped command
+        # loop again: the wrapped command may itself be another wrapper
+    return idx
+
+
+def real_command_verb(raw: str) -> str:
+    """The real command verb of ``raw`` after peeling wrappers/assignments.
+
+    Shared with the resolver and speculability gate so they classify the same
+    verb the parser does (a wrapper prefix must not hide a destructive verb).
+
+    Example::
+
+        >>> real_command_verb("env NODE_ENV=prod rm -rf src")
+        'rm'
+    """
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        tokens = raw.split()
+    idx = _strip_prefixes(tokens)
+    if idx >= len(tokens):
+        return ""
+    return canonicalize(tokens[idx].rsplit("/", 1)[-1])
+
+
 def _empty_result() -> ParsedCommand:
     """Return a ParsedCommand for empty or unparseable input."""
     return ParsedCommand(
@@ -458,6 +547,13 @@ def _extract_redirects(tokens: list[str]) -> tuple[list[str], list[str], bool]:
     for i, token in enumerate(tokens):
         if skip_next:
             skip_next = False
+            continue
+
+        # File-descriptor duplication (`2>&1`, `>&2`, `1>&2`, `2>&-`) is NOT a
+        # file redirect — it wires one stream to another. Treating it as a
+        # truncating `>` write mis-flagged benign `make 2>&1` / `pytest 2>&1`
+        # as destructive. Drop the token; no target, no clobber.
+        if _FD_DUP_PATTERN.match(token):
             continue
 
         # Standalone redirect: > file or >> file

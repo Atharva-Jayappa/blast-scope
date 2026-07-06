@@ -165,6 +165,39 @@ def _is_transactional(raw: str, sql: str) -> bool:
 # SQLite probe (read-only, stdlib)
 # ---------------------------------------------------------------------------
 
+# SQLite VM-instruction budget before a probe query is force-aborted. The WHERE
+# clause of a scoped DELETE is attacker-controlled (`WHERE id IN (WITH RECURSIVE
+# ... )`, `randomblob(...)`), and `connect(timeout=)` only guards LOCK
+# contention — it does NOT interrupt a running query. A progress handler is the
+# only real cap; without it a crafted WHERE hangs analysis for minutes.
+_PROBE_OP_BUDGET = 3_000_000
+
+
+def _open_ro_guarded(path: Path) -> sqlite3.Connection | None:
+    """Open ``path`` read-only with an opcode + wall-clock interrupt installed.
+
+    The progress handler fires every N VM instructions and aborts the query
+    (raising ``OperationalError``, caught by callers) once the opcode budget or
+    the wall-clock deadline is exceeded — so no probe query can run unbounded.
+    """
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=_PROBE_TIMEOUT)
+    except sqlite3.Error:
+        return None
+    import time
+
+    deadline = time.monotonic() + _PROBE_TIMEOUT
+    calls = [0]
+
+    def _guard() -> int:
+        calls[0] += 1
+        if calls[0] * 1000 > _PROBE_OP_BUDGET or time.monotonic() > deadline:
+            return 1  # non-zero → abort the current query
+        return 0
+
+    con.set_progress_handler(_guard, 1000)
+    return con
+
 
 def _sqlite_probe(cwd: Path, dbfile: str, table: str) -> tuple[bool, bool | None, int | None]:
     """Open the db read-only and return (available, table_exists, row_count)."""
@@ -173,9 +206,8 @@ def _sqlite_probe(cwd: Path, dbfile: str, table: str) -> tuple[bool, bool | None
         path = cwd / dbfile
     if not path.is_file():
         return (False, None, None)
-    try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=_PROBE_TIMEOUT)
-    except sqlite3.Error:
+    con = _open_ro_guarded(path)
+    if con is None:
         return (False, None, None)
     try:
         row = con.execute(
@@ -227,9 +259,8 @@ def _assess_scoped_delete(
         path = cwd / dbfile
     if not path.is_file():
         return None
-    try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=_PROBE_TIMEOUT)
-    except sqlite3.Error:
+    con = _open_ro_guarded(path)
+    if con is None:
         return None
     try:
         row = con.execute(
@@ -238,9 +269,11 @@ def _assess_scoped_delete(
         if row is None:
             return None
         total = con.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0]
+        # The WHERE is attacker text; the opcode guard on the connection aborts
+        # a pathological clause (recursive CTE, randomblob) rather than hanging.
         matched = con.execute(f'SELECT count(*) FROM "{table}" {where}').fetchone()[0]
     except sqlite3.Error:
-        return None  # bad WHERE for a bare SELECT — let the real command fail
+        return None  # bad/aborted WHERE for a bare SELECT — degrade to silent
     finally:
         con.close()
 

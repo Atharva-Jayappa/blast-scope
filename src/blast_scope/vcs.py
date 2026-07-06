@@ -169,8 +169,53 @@ def _has_force_clean(flags: list[str]) -> bool:
 
 
 def _targets_paths(raw: str, sub: str) -> bool:
-    # `git checkout -- path` or `git checkout .` discards working-tree changes.
-    return " -- " in f" {raw} " or raw.rstrip().endswith((" .", f"{sub} ."))
+    """True when a checkout/switch names a PATHSPEC (discards work), not a branch.
+
+    ``git checkout main`` switches branches (safe); ``git checkout -- app.py``,
+    ``git checkout ./src``, ``git checkout HEAD app.py`` and
+    ``git checkout main src/app.py`` all overwrite working-tree files. The
+    distinguishers: an explicit ``--``, a trailing ``.``, two+ operands (ref +
+    pathspec), or a single operand that is syntactically a path. A lone bare
+    name (``git checkout release-1.2``) stays a branch/tag switch.
+    """
+    if " -- " in f" {raw} " or raw.rstrip().endswith((" .", f"{sub} .")):
+        return True
+    operands = _tokens_after_sub(raw, sub)
+    if len(operands) >= 2:
+        return True  # `checkout <ref> <pathspec...>`
+    if operands and _looks_like_pathspec(operands[0]):
+        return True
+    return False
+
+
+def _tokens_after_sub(raw: str, sub: str) -> list[str]:
+    """Non-flag operands following the subcommand (``--`` and its tail dropped)."""
+    try:
+        toks = shlex.split(raw)
+    except ValueError:
+        toks = raw.split()
+    if sub not in toks:
+        return []
+    rest = toks[toks.index(sub) + 1 :]
+    out: list[str] = []
+    for t in rest:
+        if t == "--":
+            break
+        if t.startswith("-"):
+            continue
+        out.append(t)
+    return out
+
+
+def _looks_like_pathspec(operand: str) -> bool:
+    """Syntactic path test: a slash, a trailing slash, ``.``, or a glob char."""
+    return (
+        "/" in operand
+        or operand.endswith("/")
+        or operand == "."
+        or "*" in operand
+        or operand.startswith("./")
+    )
 
 
 def _drops_stash(raw: str) -> bool:

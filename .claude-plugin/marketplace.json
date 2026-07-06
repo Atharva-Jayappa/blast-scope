@@ -7,7 +7,7 @@
       "name": "blast-scope",
       "source": "./",
       "description": "Contextual blast-radius scoring for shell commands — an advisory PreToolUse guardrail plus MCP tools (assess / snapshots / restore).",
-      "version": "0.5.0",
+      "version": "0.5.1",
       "category": "security"
     }
   ]

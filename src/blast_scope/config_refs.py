@@ -13,6 +13,7 @@ raises a floor that scales with how many places reference it.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from blast_scope.consequences import Consequence
@@ -126,6 +127,10 @@ def _count_references(name: str, root: Path, exclude: Path) -> int:
     except OSError:
         exclude_resolved = exclude
 
+    # Whole-word match, so a target named `config` isn't "referenced" by the
+    # substring in `configparser` or a `# config handler` comment (which
+    # inflated the floor for any destructive op on a file named config/settings).
+    pattern = re.compile(r"(?<![\w.])" + re.escape(name) + r"(?![\w])")
     refs = 0
     scanned = 0
     for path in _iter_source_files(root):
@@ -141,7 +146,7 @@ def _count_references(name: str, root: Path, exclude: Path) -> int:
             text = path.read_text(encoding="utf-8", errors="ignore")[:_MAX_BYTES_PER_FILE]
         except OSError:
             continue
-        if name in text:
+        if pattern.search(text):
             refs += 1
     return refs
 

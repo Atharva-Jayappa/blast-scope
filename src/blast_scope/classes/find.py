@@ -80,6 +80,11 @@ class FindClass:
         rewritten, subtree_roots = _rewrite(candidate.raw)
         if rewritten is None:
             return None
+        # Bound the walk to the working tree: `find / -name id_rsa -delete`
+        # must not trigger a whole-disk traversal (and path disclosure) during
+        # analysis. An out-of-tree root ⇒ keep the static classification.
+        if not _roots_within_cwd(rewritten, cwd):
+            return None
         out = _run_find(rewritten, cwd)
         if out is None:
             return None
@@ -115,6 +120,34 @@ def _tokens(raw: str) -> list[str]:
         return shlex.split(raw)
     except ValueError:
         return raw.split()
+
+
+def _roots_within_cwd(argv: list[str], cwd: Path) -> bool:
+    """True if every ``find`` root path resolves inside the working tree.
+
+    Roots are the operands between ``find`` and the first predicate/option
+    (a token starting with ``-``, ``(``, ``!``). Absolute or ``../`` roots that
+    escape ``cwd`` disqualify the probe.
+    """
+    try:
+        cwd_res = cwd.resolve()
+    except OSError:
+        return False
+    roots: list[str] = []
+    for tok in argv[1:]:
+        if tok.startswith(("-", "(", "!")):
+            break
+        roots.append(tok)
+    if not roots:
+        return False  # no explicit root → find defaults to cwd, but be strict
+    for r in roots:
+        p = Path(r)
+        try:
+            resolved = p.resolve() if (p.is_absolute() or r.startswith("/")) else (cwd_res / r).resolve()
+            resolved.relative_to(cwd_res)
+        except (OSError, ValueError):
+            return False
+    return True
 
 
 def _rewrite(raw: str) -> tuple[list[str] | None, bool]:
