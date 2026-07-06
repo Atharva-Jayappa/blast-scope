@@ -9,6 +9,7 @@ from __future__ import annotations
 import glob
 import itertools
 import logging
+import os
 from pathlib import Path
 from typing import Mapping
 
@@ -229,14 +230,24 @@ def assess(
         if extra:
             consequences_per_command[0] = list(consequences_per_command[0] or []) + extra
 
+    # Speculative execution (opt-in): the ground-truth oracle. When enabled
+    # and the whole chain is containable in a filesystem overlay, run it in a
+    # CoW sandbox and fold the *observed* deletions/overwrites into the first
+    # step's consequences — feeding the same targets channel the static
+    # oracles use. Off the default path (env-gated) because it EXECUTES the
+    # command; see speculate.py for the isolation guarantees.
+    spec_cons = _maybe_speculate(command, parsed_list, working_dir)
+    if spec_cons is not None and parsed_list:
+        consequences_per_command[0] = list(consequences_per_command[0] or []) + [spec_cons]
+
     # Dry-run oracle targets: when an analyzer *observed* the exact paths a
-    # command destroys (git clean -n, find -print, rsync -n), merge them into
-    # the step's parsed targets before scoring. One merge point and every
-    # downstream consumer sees the real victims: worst-case recoverability
-    # re-classifies them, the mass-destruction gate counts real source files,
-    # and the hook's undo snapshot archives them (it reads the chain step's
-    # parsed targets — which for `git clean .`/`find -delete` are otherwise
-    # just "." or a glob token).
+    # command destroys (git clean -n, find -print, rsync -n, or the overlay
+    # sandbox), merge them into the step's parsed targets before scoring. One
+    # merge point and every downstream consumer sees the real victims:
+    # worst-case recoverability re-classifies them, the mass-destruction gate
+    # counts real source files, and the hook's undo snapshot archives them (it
+    # reads the chain step's parsed targets — which for `git clean .`/
+    # `find -delete` are otherwise just "." or a glob token).
     for i, cons in enumerate(consequences_per_command):
         oracle_targets: list[str] = []
         for c in cons or []:
@@ -269,6 +280,46 @@ def assess(
     )
 
     return dict(assessment)
+
+
+def _maybe_speculate(
+    command: str, parsed_list: list, working_dir: Path
+) -> consequence_engine.Consequence | None:
+    """Run the overlay sandbox when opted in and the chain is containable.
+
+    Returns a ``Consequence`` carrying the observed deleted/overwritten paths
+    (domain ``fs``, floor 0 — the targets drive the score via recoverability),
+    or ``None`` when speculation is off, unavailable, refused, or observed
+    nothing. Never raises: speculation is advisory like every other analyzer.
+    """
+    if os.environ.get("BLAST_SCOPE_SPECULATE") not in ("1", "true", "yes"):
+        return None
+    try:
+        from blast_scope import speculate as spec
+
+        if not spec.available():
+            return None
+        verdict = spec.is_speculable(command, parsed_list, working_dir)
+        if not verdict.ok:
+            logger.debug("not speculating %r: %s", command, verdict.reason)
+            return None
+        result = spec.speculate(command, working_dir)
+        if not result.ran or not result.destroyed:
+            return None
+        targets = [str((working_dir / p)) for p in result.destroyed]
+        shown = ", ".join(Path(p).name for p in result.destroyed[:6])
+        if len(result.destroyed) > 6:
+            shown += "…"
+        return consequence_engine.Consequence(
+            "fs",
+            0.0,
+            f"speculative run (CoW sandbox) destroyed/overwrote "
+            f"{len(result.destroyed)} path(s): {shown}",
+            targets=tuple(targets),
+        )
+    except Exception:  # advisory — a sandbox bug must never break assessment
+        logger.exception("speculation failed for %r", command)
+        return None
 
 
 def _graph_exists(project_root: Path) -> bool:

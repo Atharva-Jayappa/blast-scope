@@ -24,6 +24,28 @@ jobs:
       - name: Run calibration eval (floors pinned in tests, shown here for visibility)
         run: uv run python -m blast_scope.eval
 
+  sandbox:
+    # Speculative execution runs only on Linux with unprivileged namespaces —
+    # exactly what GitHub's ubuntu runner provides and what the dev machine
+    # (Windows) cannot. This job is where the real overlay sandbox and its
+    # safety invariant (the real tree is never touched) actually execute.
+    name: overlay sandbox (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Verify the sandbox is available on this runner
+        run: |
+          uv run python - << 'EOF'
+          from blast_scope import speculate
+          assert speculate.available(), "overlay sandbox must be available on ubuntu CI"
+          print("overlay sandbox available")
+          EOF
+      - name: Run the real-sandbox tests (safety invariant)
+        run: uv run --extra dev pytest tests/test_speculate.py -q -rs
+
   build:
     name: build wheel + sdist
     runs-on: ubuntu-latest
@@ -46,7 +68,7 @@ jobs:
     # Single required status check for branch protection — green only when
     # every matrix job and the build succeed.
     name: ci-ok
-    needs: [test, build]
+    needs: [test, sandbox, build]
     runs-on: ubuntu-latest
     steps:
       - run: echo "all green"

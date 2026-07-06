@@ -218,6 +218,40 @@ Windows `find.exe` being a string-search tool, missing ref) → labeled
 estimate or silent fallback to the static classification. A failing probe
 never blocks and never scores lower than not probing.
 
+## Speculative execution (opt-in — the ground-truth oracle)
+
+The dry-run oracles rewrite or preview a command without running it. Speculative
+execution (`speculate.py`) goes one step further on the ladder: it **runs the
+command** against a disposable copy-on-write copy of the working tree and diffs
+the scratch layer to observe *exactly* what was created, modified, or deleted —
+no rewriting, no per-verb cleverness, the kernel does the work. The observed
+deletions/overwrites feed the same `Consequence.targets` channel the static
+oracles use, so recoverability, the mass gate, and the undo snapshot all see
+the real victims.
+
+This is the one analyzer that executes the analyzed command, so isolation is
+layered and any single layer suffices:
+
+1. **overlayfs never writes the lower layer.** The real tree is the read-only
+   lowerdir; every write lands in a throwaway upperdir. A kernel guarantee.
+2. **Private mount namespace** (`unshare --mount`) — the overlay can't leak
+   into the parent mount table.
+3. **Severed network namespace** (`unshare --net`) — no interfaces, so a
+   "preview" can't exfiltrate or phone home.
+4. **Speculability gate** (`is_speculable`) — deny-by-default: network verbs,
+   `sudo`/device access, external-state mutations (`git push`, `docker`, `npm`,
+   already covered by dedicated oracles), and absolute writes outside cwd are
+   refused and fall back to static analysis.
+5. **Opt-in only** — nothing runs unless `BLAST_SCOPE_SPECULATE=1`. Never on
+   the default hook path.
+
+**Availability is narrow by design:** Linux with unprivileged user + overlay
+namespaces (kernel ≥ 5.11, not distro-disabled). Everywhere else — including
+the fundamental limit that network and external-DB effects are *not*
+CoW-reversible — it returns unavailable and the static oracles stand. The real
+sandbox and its safety invariant (*after a destructive run, the real tree is
+untouched*) are exercised on the Linux CI runner.
+
 ## Severity & recommendation
 
 | score      | severity  | recommendation |
