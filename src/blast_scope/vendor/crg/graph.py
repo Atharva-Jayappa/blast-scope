@@ -2,7 +2,7 @@
 
 Stores code structure as nodes (File, Class, Function, Type, Test) and
 edges (CALLS, IMPORTS_FROM, INHERITS, IMPLEMENTS, CONTAINS, TESTED_BY, DEPENDS_ON, REFERENCES).
-Supports impact-radius queries and subgraph extraction.
+Supports reverse-impact queries (who depends on a file).
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .constants import MAX_IMPACT_DEPTH, MAX_IMPACT_NODES
-from .migrations import get_schema_version, run_migrations
 from .parser import EdgeInfo, NodeInfo
 
 logger = logging.getLogger(__name__)
@@ -130,15 +129,6 @@ class GraphStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
-        # Ensure schema_version is set, then run pending migrations
-        if get_schema_version(self._conn) < 1:
-            # Fresh DB — metadata table just created by _init_schema
-            self._conn.execute(
-                "INSERT OR IGNORE INTO metadata (key, value) "
-                "VALUES ('schema_version', '1')"
-            )
-            self._conn.commit()
-        run_migrations(self._conn)
 
     def __enter__(self) -> "GraphStore":
         return self
@@ -260,19 +250,7 @@ class GraphStore:
         row = self._conn.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
 
-    def commit(self) -> None:
-        self._conn.commit()
-
-    def rollback(self) -> None:
-        self._conn.rollback()
-
     # --- Read operations ---
-
-    def get_node(self, qualified_name: str) -> Optional[GraphNode]:
-        row = self._conn.execute(
-            "SELECT * FROM nodes WHERE qualified_name = ?", (qualified_name,)
-        ).fetchone()
-        return self._row_to_node(row) if row else None
 
     def get_nodes_by_file(self, file_path: str) -> list[GraphNode]:
         rows = self._conn.execute(
@@ -280,30 +258,9 @@ class GraphStore:
         ).fetchall()
         return [self._row_to_node(r) for r in rows]
 
-    def get_edges_by_source(self, qualified_name: str) -> list[GraphEdge]:
-        rows = self._conn.execute(
-            "SELECT * FROM edges WHERE source_qualified = ?", (qualified_name,)
-        ).fetchall()
-        return [self._row_to_edge(r) for r in rows]
-
     def get_edges_by_target(self, qualified_name: str) -> list[GraphEdge]:
         rows = self._conn.execute(
             "SELECT * FROM edges WHERE target_qualified = ?", (qualified_name,)
-        ).fetchall()
-        return [self._row_to_edge(r) for r in rows]
-
-    def search_edges_by_target_name(self, name: str, kind: str = "CALLS") -> list[GraphEdge]:
-        """Search for edges where target_qualified matches an unqualified name.
-
-        CALLS edges often store unqualified target names (e.g. ``generateTestCode``)
-        rather than fully qualified ones (``file.ts::generateTestCode``).  This
-        method finds those edges by exact match on the plain function name so that
-        reverse call tracing (callers_of) works even when qualified-name lookup
-        returns nothing.
-        """
-        rows = self._conn.execute(
-            "SELECT * FROM edges WHERE target_qualified = ? AND kind = ?",
-            (name, kind),
         ).fetchall()
         return [self._row_to_edge(r) for r in rows]
 
@@ -324,165 +281,7 @@ class GraphStore:
         ).fetchall()
         return {r["file_path"]: (r["file_hash"] or "") for r in rows}
 
-    def search_nodes(self, query: str, limit: int = 20) -> list[GraphNode]:
-        """Keyword search across node names with multi-word AND logic.
-
-        Each word in the query must match independently (case-insensitive)
-        against the node name or qualified name. For example,
-        ``"firebase auth"`` matches ``verify_firebase_token`` and
-        ``FirebaseAuth`` but not ``get_user``.
-        """
-        words = query.lower().split()
-        if not words:
-            return []
-
-        conditions: list[str] = []
-        params: list[str | int] = []
-        for word in words:
-            conditions.append(
-                "(LOWER(name) LIKE ? OR LOWER(qualified_name) LIKE ?)"
-            )
-            params.extend([f"%{word}%", f"%{word}%"])
-
-        where = " AND ".join(conditions)
-        sql = f"SELECT * FROM nodes WHERE {where} LIMIT ?"  # nosec B608
-        params.append(limit)
-        rows = self._conn.execute(sql, params).fetchall()
-        return [self._row_to_node(r) for r in rows]
-
     # --- Impact / Graph traversal ---
-
-    def get_impact_radius(
-        self,
-        changed_files: list[str],
-        max_depth: int = MAX_IMPACT_DEPTH,
-        max_nodes: int = MAX_IMPACT_NODES,
-    ) -> dict[str, Any]:
-        """BFS from changed files to find all impacted nodes within depth N.
-
-        Uses SQLite recursive CTE for traversal.
-
-        Returns dict with:
-          - changed_nodes: nodes in changed files
-          - impacted_nodes: nodes reachable via edges
-          - impacted_files: unique set of affected files
-          - edges: connecting edges
-        """
-        return self.get_impact_radius_sql(
-            changed_files, max_depth=max_depth, max_nodes=max_nodes,
-        )
-
-    # -- SQLite recursive CTE version (default) ---------------------------
-
-    def get_impact_radius_sql(
-        self,
-        changed_files: list[str],
-        max_depth: int = MAX_IMPACT_DEPTH,
-        max_nodes: int = MAX_IMPACT_NODES,
-    ) -> dict[str, Any]:
-        """Impact radius via SQLite recursive CTE.
-
-        Faster than NetworkX for large graphs because it avoids
-        materialising the full graph in Python.
-        """
-        if not changed_files:
-            return {
-                "changed_nodes": [],
-                "impacted_nodes": [],
-                "impacted_files": [],
-                "edges": [],
-                "truncated": False,
-                "total_impacted": 0,
-            }
-
-        # Seed qualified names
-        seeds: set[str] = set()
-        for f in changed_files:
-            nodes = self.get_nodes_by_file(f)
-            for n in nodes:
-                seeds.add(n.qualified_name)
-
-        if not seeds:
-            return {
-                "changed_nodes": [],
-                "impacted_nodes": [],
-                "impacted_files": [],
-                "edges": [],
-                "truncated": False,
-                "total_impacted": 0,
-            }
-
-        # Build recursive CTE — use a temp table for the seed set to
-        # keep the query plan efficient and stay under variable limits.
-        self._conn.execute(
-            "CREATE TEMP TABLE IF NOT EXISTS _impact_seeds "
-            "(qn TEXT PRIMARY KEY)"
-        )
-        self._conn.execute("DELETE FROM _impact_seeds")
-        batch_size = 450
-        seed_list = list(seeds)
-        for i in range(0, len(seed_list), batch_size):
-            batch = seed_list[i:i + batch_size]
-            placeholders = ",".join("(?)" for _ in batch)
-            self._conn.execute(  # nosec B608
-                f"INSERT OR IGNORE INTO _impact_seeds (qn) VALUES {placeholders}",
-                batch,
-            )
-
-        cte_sql = """
-        WITH RECURSIVE impacted(node_qn, depth) AS (
-            SELECT qn, 0 FROM _impact_seeds
-            UNION
-            SELECT e.target_qualified, i.depth + 1
-            FROM impacted i
-            JOIN edges e ON e.source_qualified = i.node_qn
-            WHERE i.depth < ?
-            UNION
-            SELECT e.source_qualified, i.depth + 1
-            FROM impacted i
-            JOIN edges e ON e.target_qualified = i.node_qn
-            WHERE i.depth < ?
-        )
-        SELECT DISTINCT node_qn, MIN(depth) AS min_depth
-        FROM impacted
-        GROUP BY node_qn
-        LIMIT ?
-        """
-        rows = self._conn.execute(
-            cte_sql, (max_depth, max_depth, max_nodes + len(seeds)),
-        ).fetchall()
-
-        # Split into seeds vs impacted
-        impacted_qns: set[str] = set()
-        for r in rows:
-            qn = r[0]
-            if qn not in seeds:
-                impacted_qns.add(qn)
-
-        # Batch-fetch nodes
-        changed_nodes = self._batch_get_nodes(seeds)
-        impacted_nodes = self._batch_get_nodes(impacted_qns)
-
-        total_impacted = len(impacted_nodes)
-        truncated = total_impacted > max_nodes
-        if truncated:
-            impacted_nodes = impacted_nodes[:max_nodes]
-
-        impacted_files = list({n.file_path for n in impacted_nodes})
-
-        relevant_edges: list[GraphEdge] = []
-        all_qns = seeds | {n.qualified_name for n in impacted_nodes}
-        if all_qns:
-            relevant_edges = self.get_edges_among(all_qns)
-
-        return {
-            "changed_nodes": changed_nodes,
-            "impacted_nodes": impacted_nodes,
-            "impacted_files": impacted_files,
-            "edges": relevant_edges,
-            "truncated": truncated,
-            "total_impacted": total_impacted,
-        }
 
     def get_reverse_impact_sql(
         self,
@@ -550,23 +349,6 @@ class GraphStore:
         )
         return {"changed_nodes": changed_nodes, "dependents": dependents[:max_nodes]}
 
-    def get_subgraph(self, qualified_names: list[str]) -> dict[str, Any]:
-        """Extract a subgraph containing the specified nodes and their connecting edges."""
-        nodes = []
-        for qn in qualified_names:
-            node = self.get_node(qn)
-            if node:
-                nodes.append(node)
-
-        edges = []
-        qn_set = set(qualified_names)
-        for qn in qualified_names:
-            for e in self.get_edges_by_source(qn):
-                if e.target_qualified in qn_set:
-                    edges.append(e)
-
-        return {"nodes": nodes, "edges": edges}
-
     def get_stats(self) -> GraphStats:
         """Return aggregate statistics about the graph."""
         total_nodes = self._conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
@@ -602,334 +384,12 @@ class GraphStore:
             last_updated=last_updated,
         )
 
-    def get_nodes_by_size(
-        self,
-        min_lines: int = 50,
-        max_lines: int | None = None,
-        kind: str | None = None,
-        file_path_pattern: str | None = None,
-        limit: int = 50,
-    ) -> list[GraphNode]:
-        """Find nodes within a line-count range, ordered largest first.
-
-        Args:
-            min_lines: Minimum line count threshold (inclusive).
-            max_lines: Maximum line count threshold (inclusive). None = no upper bound.
-            kind: Filter by node kind (Function, Class, File, etc.).
-            file_path_pattern: SQL LIKE pattern to filter by file path.
-            limit: Maximum results to return.
-
-        Returns:
-            List of GraphNode objects, ordered by line count descending.
-        """
-        conditions = [
-            "line_start IS NOT NULL",
-            "line_end IS NOT NULL",
-            "(line_end - line_start + 1) >= ?",
-        ]
-        params: list = [min_lines]
-
-        if max_lines is not None:
-            conditions.append("(line_end - line_start + 1) <= ?")
-            params.append(max_lines)
-        if kind:
-            conditions.append("kind = ?")
-            params.append(kind)
-        if file_path_pattern:
-            conditions.append("file_path LIKE ?")
-            params.append(f"%{file_path_pattern}%")
-
-        params.append(limit)
-        where = " AND ".join(conditions)
-        rows = self._conn.execute(
-            f"SELECT * FROM nodes WHERE {where} "  # nosec B608
-            "ORDER BY (line_end - line_start + 1) DESC LIMIT ?",
-            params,
-        ).fetchall()
-        return [self._row_to_node(r) for r in rows]
-
-    # --- Public query helpers (used by flows, changes, communities, etc.) ---
-
-    def get_node_by_id(self, node_id: int) -> Optional[GraphNode]:
-        """Fetch a single node by its integer primary key."""
-        row = self._conn.execute(
-            "SELECT * FROM nodes WHERE id = ?", (node_id,)
-        ).fetchone()
-        return self._row_to_node(row) if row else None
-
-    def get_nodes_by_kind(
-        self,
-        kinds: list[str],
-        file_pattern: str | None = None,
-    ) -> list[GraphNode]:
-        """Return nodes matching any of *kinds*, optionally filtered by file.
-
-        Args:
-            kinds: List of node kind strings (e.g. ``["Function", "Test"]``).
-            file_pattern: If provided, only nodes whose ``file_path``
-                contains *file_pattern* (SQL LIKE ``%pattern%``) are
-                returned.
-        """
-        if not kinds:
-            return []
-        placeholders = ",".join("?" for _ in kinds)
-        conditions = [f"kind IN ({placeholders})"]
-        params: list[str] = list(kinds)
-        if file_pattern:
-            conditions.append("file_path LIKE ?")
-            params.append(f"%{file_pattern}%")
-        where = " AND ".join(conditions)
-        rows = self._conn.execute(  # nosec B608
-            f"SELECT * FROM nodes WHERE {where}", params,
-        ).fetchall()
-        return [self._row_to_node(r) for r in rows]
-
-    def count_flow_memberships(self, node_id: int) -> int:
-        """Return the number of flows a node participates in."""
-        row = self._conn.execute(
-            "SELECT COUNT(*) as cnt FROM flow_memberships "
-            "WHERE node_id = ?",
-            (node_id,),
-        ).fetchone()
-        return row["cnt"] if row else 0
-
-    def get_node_community_id(self, node_id: int) -> int | None:
-        """Return the ``community_id`` for a node, or ``None``."""
-        row = self._conn.execute(
-            "SELECT community_id FROM nodes WHERE id = ?",
-            (node_id,),
-        ).fetchone()
-        if row and row["community_id"] is not None:
-            return row["community_id"]
-        return None
-
-    def get_community_ids_by_qualified_names(
-        self, qns: list[str],
-    ) -> dict[str, int | None]:
-        """Batch-fetch ``community_id`` for a list of qualified names.
-
-        Returns a mapping from qualified name to community_id (may be
-        ``None`` if the node has no assigned community).
-        """
-        result: dict[str, int | None] = {}
-        batch_size = 450
-        for i in range(0, len(qns), batch_size):
-            batch = qns[i:i + batch_size]
-            placeholders = ",".join("?" for _ in batch)
-            rows = self._conn.execute(  # nosec B608
-                "SELECT qualified_name, community_id FROM nodes "
-                f"WHERE qualified_name IN ({placeholders})",
-                batch,
-            ).fetchall()
-            for r in rows:
-                result[r["qualified_name"]] = r["community_id"]
-        return result
-
-    def get_files_matching(self, pattern: str) -> list[str]:
-        """Return distinct ``file_path`` values matching a LIKE suffix."""
-        rows = self._conn.execute(
-            "SELECT DISTINCT file_path FROM nodes "
-            "WHERE file_path LIKE ?",
-            (f"%{pattern}",),
-        ).fetchall()
-        return [r["file_path"] for r in rows]
-
-    def get_nodes_without_signature(self) -> list[sqlite3.Row]:
-        """Return raw rows for nodes that have no signature yet."""
-        return self._conn.execute(
-            "SELECT id, name, kind, params, return_type "
-            "FROM nodes WHERE signature IS NULL"
-        ).fetchall()
-
-    def update_node_signature(
-        self, node_id: int, signature: str,
-    ) -> None:
-        """Set the ``signature`` column for a single node."""
-        self._conn.execute(
-            "UPDATE nodes SET signature = ? WHERE id = ?",
-            (signature, node_id),
-        )
-
-    def get_all_community_ids(self) -> dict[str, int | None]:
-        """Return a mapping of *all* qualified names to their community_id.
-
-        Used primarily by the visualization exporter.
-        """
-        try:
-            rows = self._conn.execute(
-                "SELECT qualified_name, community_id FROM nodes"
-            ).fetchall()
-            return {
-                r["qualified_name"]: r["community_id"]
-                for r in rows
-            }
-        except sqlite3.OperationalError as exc:
-            # community_id column may not exist yet on pre-v6 schemas
-            logger.debug("Community IDs unavailable (schema not yet migrated): %s", exc)
-            return {}
-
-    def get_node_ids_by_files(
-        self, file_paths: list[str],
-    ) -> set[int]:
-        """Return node IDs belonging to the given file paths."""
-        if not file_paths:
-            return set()
-        result: set[int] = set()
-        batch_size = 450
-        for i in range(0, len(file_paths), batch_size):
-            batch = file_paths[i:i + batch_size]
-            placeholders = ",".join("?" for _ in batch)
-            rows = self._conn.execute(  # nosec B608
-                "SELECT id FROM nodes "
-                f"WHERE file_path IN ({placeholders})",
-                batch,
-            ).fetchall()
-            result.update(r["id"] for r in rows)
-        return result
-
-    def get_flow_ids_by_node_ids(
-        self, node_ids: set[int],
-    ) -> list[int]:
-        """Return distinct flow IDs that contain any of *node_ids*."""
-        if not node_ids:
-            return []
-        nids = list(node_ids)
-        result: list[int] = []
-        batch_size = 450
-        for i in range(0, len(nids), batch_size):
-            batch = nids[i:i + batch_size]
-            placeholders = ",".join("?" for _ in batch)
-            rows = self._conn.execute(  # nosec B608
-                "SELECT DISTINCT flow_id FROM flow_memberships "
-                f"WHERE node_id IN ({placeholders})",
-                batch,
-            ).fetchall()
-            result.extend(r["flow_id"] for r in rows)
-        # Deduplicate across batches
-        return list(dict.fromkeys(result))
-
-    def get_flow_qualified_names(self, flow_id: int) -> set[str]:
-        """Return the set of qualified names for nodes in a flow."""
-        rows = self._conn.execute(
-            "SELECT n.qualified_name FROM flow_memberships fm "
-            "JOIN nodes n ON fm.node_id = n.id WHERE fm.flow_id = ?",
-            (flow_id,),
-        ).fetchall()
-        return {r["qualified_name"] for r in rows}
-
-    def get_node_kind_by_id(self, node_id: int) -> str | None:
-        """Return just the ``kind`` column for a node, or ``None``."""
-        row = self._conn.execute(
-            "SELECT kind FROM nodes WHERE id = ?", (node_id,),
-        ).fetchone()
-        return row["kind"] if row else None
-
-    def get_all_call_targets(self) -> set[str]:
-        """Return the set of all CALLS-edge target qualified names."""
-        rows = self._conn.execute(
-            "SELECT DISTINCT target_qualified FROM edges "
-            "WHERE kind = 'CALLS'"
-        ).fetchall()
-        return {r["target_qualified"] for r in rows}
-
-    def get_communities_list(
-        self,
-    ) -> list[sqlite3.Row]:
-        """Return raw rows from the ``communities`` table."""
-        try:
-            return self._conn.execute(
-                "SELECT id, name FROM communities"
-            ).fetchall()
-        except sqlite3.OperationalError as exc:
-            # communities table doesn't exist yet on pre-v4 schemas
-            logger.debug("Communities list unavailable (table missing): %s", exc)
-            return []
-
-    def get_community_member_qns(
-        self, community_id: int,
-    ) -> list[str]:
-        """Return qualified names of nodes in a community."""
-        rows = self._conn.execute(
-            "SELECT qualified_name FROM nodes "
-            "WHERE community_id = ?",
-            (community_id,),
-        ).fetchall()
-        return [r["qualified_name"] for r in rows]
-
-    def get_nodes_by_community_id(
-        self, community_id: int,
-    ) -> list[GraphNode]:
-        """Return all nodes belonging to a community."""
-        rows = self._conn.execute(
-            "SELECT * FROM nodes WHERE community_id = ?",
-            (community_id,),
-        ).fetchall()
-        return [self._row_to_node(r) for r in rows]
-
-    def get_outgoing_targets(
-        self, source_qns: list[str],
-    ) -> list[str]:
-        """Return ``target_qualified`` for edges sourced from *source_qns*."""
-        results: list[str] = []
-        batch_size = 450
-        for i in range(0, len(source_qns), batch_size):
-            batch = source_qns[i:i + batch_size]
-            placeholders = ",".join("?" for _ in batch)
-            rows = self._conn.execute(  # nosec B608
-                "SELECT target_qualified FROM edges "
-                f"WHERE source_qualified IN ({placeholders})",
-                batch,
-            ).fetchall()
-            results.extend(r["target_qualified"] for r in rows)
-        return results
-
-    def get_incoming_sources(
-        self, target_qns: list[str],
-    ) -> list[str]:
-        """Return ``source_qualified`` for edges targeting *target_qns*."""
-        results: list[str] = []
-        batch_size = 450
-        for i in range(0, len(target_qns), batch_size):
-            batch = target_qns[i:i + batch_size]
-            placeholders = ",".join("?" for _ in batch)
-            rows = self._conn.execute(  # nosec B608
-                "SELECT source_qualified FROM edges "
-                f"WHERE target_qualified IN ({placeholders})",
-                batch,
-            ).fetchall()
-            results.extend(r["source_qualified"] for r in rows)
-        return results
-
-    # --- Public edge access (for visualization etc.) ---
+    # --- Public edge access ---
 
     def get_all_edges(self) -> list[GraphEdge]:
         """Return all edges in the graph."""
         rows = self._conn.execute("SELECT * FROM edges").fetchall()
         return [self._row_to_edge(r) for r in rows]
-
-    def get_edges_among(self, qualified_names: set[str]) -> list[GraphEdge]:
-        """Return edges where both source and target are in the given set.
-
-        Batches the source-side IN clause to stay under SQLite's default
-        SQLITE_MAX_VARIABLE_NUMBER limit, then filters targets in Python.
-        """
-        if not qualified_names:
-            return []
-        qns = list(qualified_names)
-        results: list[GraphEdge] = []
-        batch_size = 450  # Stay well under SQLite's default 999 limit
-        for i in range(0, len(qns), batch_size):
-            batch = qns[i:i + batch_size]
-            placeholders = ",".join("?" for _ in batch)
-            rows = self._conn.execute(  # nosec B608
-                f"SELECT * FROM edges WHERE source_qualified IN ({placeholders})",
-                batch,
-            ).fetchall()
-            for r in rows:
-                edge = self._row_to_edge(r)
-                if edge.target_qualified in qualified_names:
-                    results.append(edge)
-        return results
 
     def _batch_get_nodes(self, qualified_names: set[str]) -> list[GraphNode]:
         """Batch-fetch nodes by qualified name, staying under SQLite variable limits."""
@@ -985,40 +445,3 @@ class GraphStore:
             line=row["line"],
             extra=json.loads(row["extra"]) if row["extra"] else {},
         )
-
-
-def _sanitize_name(s: str, max_len: int = 256) -> str:
-    """Strip ASCII control characters and truncate to prevent prompt injection.
-
-    Node names extracted from source code could contain adversarial strings
-    (e.g. ``IGNORE_ALL_PREVIOUS_INSTRUCTIONS``).  This function removes control
-    characters (0x00-0x1F except tab and newline) and enforces a length limit so
-    that names flowing through MCP tool responses cannot easily influence AI
-    agent behaviour.
-    """
-    # Strip control chars 0x00-0x1F except \t (0x09) and \n (0x0A)
-    cleaned = "".join(
-        ch for ch in s
-        if ch in ("\t", "\n") or ord(ch) >= 0x20
-    )
-    return cleaned[:max_len]
-
-
-def node_to_dict(n: GraphNode) -> dict:
-    return {
-        "id": n.id, "kind": n.kind, "name": _sanitize_name(n.name),
-        "qualified_name": _sanitize_name(n.qualified_name), "file_path": n.file_path,
-        "line_start": n.line_start, "line_end": n.line_end,
-        "language": n.language,
-        "parent_name": _sanitize_name(n.parent_name) if n.parent_name else n.parent_name,
-        "is_test": n.is_test,
-    }
-
-
-def edge_to_dict(e: GraphEdge) -> dict:
-    return {
-        "id": e.id, "kind": e.kind,
-        "source": _sanitize_name(e.source_qualified),
-        "target": _sanitize_name(e.target_qualified),
-        "file_path": e.file_path, "line": e.line,
-    }
