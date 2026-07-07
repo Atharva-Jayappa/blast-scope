@@ -1,6 +1,6 @@
 {
   "name": "blast-scope",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Scores the blast radius of a shell command before your agent runs it — advisory, never blocking. Same command, opposite score depending on what it would actually hit.",
   "author": { "name": "Atharva Jayappa", "url": "https://github.com/Atharva-Jayappa" },
   "homepage": "https://github.com/Atharva-Jayappa/blast-scope",

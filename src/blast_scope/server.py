@@ -123,6 +123,16 @@ def assess(
     working_dir = Path(cwd) if cwd else Path.cwd()
     root_path = Path(project_root) if project_root else None
 
+    # Read fresh git/working-tree state for every assessment. The recoverability
+    # cache is keyed by repo path with no world-state component, so in a
+    # long-lived MCP server it would otherwise serve the first-seen tree state
+    # for a repeated command (e.g. `git reset --hard` stuck on its clean-tree
+    # LOW after the tree went dirty). Clearing here keeps within-call caching —
+    # a chain scoring the same repo many times still reads git once — while
+    # making each independent assessment reflect the current world. The hook
+    # path was already safe because it is process-per-command.
+    clear_cache()
+
     # Script transparency: rewrite wrapper commands (sh -c, npm run, script
     # files, make targets) into what they actually execute, so the chain
     # below scores the real commands. Wrappers that stay opaque contribute
