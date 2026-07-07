@@ -32,6 +32,7 @@ harness at a local clone's ``dataset/data/tasks.jsonl`` (see ``bench/README.md``
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import re
@@ -119,6 +120,56 @@ def load_tasks(path: Path | str) -> list[dict[str, Any]]:
     """
     text = Path(path).read_text(encoding="utf-8")
     return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+# ---------------------------------------------------------------------------
+# Held-out split (overfit guard)
+# ---------------------------------------------------------------------------
+
+# SABER is a calibration signal, not a training target: tuning floors until
+# specific misses flip can encode benchmark artifacts. The guard is a fixed
+# dev/holdout split — tune against ``dev``, then confirm the change holds on
+# ``holdout``, which no calibration decision may be based on.
+#
+# The split is STRATIFIED by (category, scenario): SABER's strata are small
+# (some categories have <20 recoverable harmful commands), so an unstratified
+# random split can leave a category nearly absent from holdout and its holdout
+# number is noise. Within each stratum, tasks are ranked by a deterministic
+# hash of ``task_id`` and the top 30% go to holdout — stable across runs,
+# machines, and dataset re-clones; independent of file order.
+
+_HOLDOUT_FRACTION = 0.3
+
+
+def split_tasks(tasks: list[dict[str, Any]], split: str) -> list[dict[str, Any]]:
+    """Return the tasks belonging to ``split`` ("all", "dev", or "holdout").
+
+    Example::
+
+        >>> dev = split_tasks(tasks, "dev")
+        >>> holdout = split_tasks(tasks, "holdout")
+        >>> len(dev) + len(holdout) == len(tasks)
+        True
+    """
+    if split == "all":
+        return tasks
+
+    strata: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for i, task in enumerate(tasks):
+        strata[(task.get("category", "?"), task.get("scenario", "?"))].append(i)
+
+    def rank(i: int) -> str:
+        tid = str(tasks[i].get("task_id", i))
+        return hashlib.md5(tid.encode(), usedforsecurity=False).hexdigest()
+
+    holdout_idx: set[int] = set()
+    for members in strata.values():
+        members.sort(key=rank)
+        holdout_idx.update(members[: round(len(members) * _HOLDOUT_FRACTION)])
+
+    if split == "holdout":
+        return [t for i, t in enumerate(tasks) if i in holdout_idx]
+    return [t for i, t in enumerate(tasks) if i not in holdout_idx]
 
 
 # ---------------------------------------------------------------------------
@@ -475,12 +526,14 @@ def aggregate(benign: list[Scored], harmful: list[Scored]) -> Report:
     )
 
 
-def format_report(r: Report, *, index: bool) -> str:
+def format_report(r: Report, *, index: bool, split: str = "all") -> str:
     """Render a human-readable calibration report."""
     out: list[str] = []
     out.append("blast-scope × SABER calibration")
     out.append("=" * 60)
     out.append(f"graph indexing: {'ON' if index else 'OFF (fast / hook-path)'}")
+    if split != "all":
+        out.append(f"split: {split.upper()} — holdout numbers must never drive calibration")
     out.append("")
     out.append("BENIGN  (expected_safe_commands — should all proceed)")
     out.append(
@@ -517,10 +570,11 @@ def format_report(r: Report, *, index: bool) -> str:
     return "\n".join(out)
 
 
-def report_dict(r: Report, *, index: bool) -> dict[str, Any]:
+def report_dict(r: Report, *, index: bool, split: str = "all") -> dict[str, Any]:
     """Machine-readable summary (for pinning / regression tracking)."""
     return {
         "index": index,
+        "split": split,
         "benign_total": r.benign_total,
         "benign_flagged": r.benign_flagged,
         "false_positive_rate": round(r.false_positive_rate, 4),
@@ -562,20 +616,28 @@ def main(argv: list[str] | None = None) -> int:
         action="store_false",
         help="Score against SABER's raw stubs (don't rebuild DBs / create targets).",
     )
+    parser.add_argument(
+        "--split",
+        choices=("all", "dev", "holdout"),
+        default="all",
+        help="Task slice to score: tune against 'dev', validate on 'holdout' (overfit guard).",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Score only the first N tasks.")
     parser.add_argument("--json", dest="json_out", help="Also write the summary JSON here.")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
-    tasks = load_tasks(args.tasks)
+    tasks = split_tasks(load_tasks(args.tasks), args.split)
+    logger.info("scoring %d tasks (split=%s)", len(tasks), args.split)
     benign, harmful = evaluate(
         tasks, index=args.index, git=args.git, realistic=args.realistic, limit=args.limit
     )
     report = aggregate(benign, harmful)
-    print(format_report(report, index=args.index))
+    print(format_report(report, index=args.index, split=args.split))
     if args.json_out:
         Path(args.json_out).write_text(
-            json.dumps(report_dict(report, index=args.index), indent=2), encoding="utf-8"
+            json.dumps(report_dict(report, index=args.index, split=args.split), indent=2),
+            encoding="utf-8",
         )
     return 0
 

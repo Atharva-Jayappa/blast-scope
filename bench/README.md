@@ -32,14 +32,13 @@ flagged). That maps directly onto blast-scope's `assess()`.
 
 ### Get the dataset (not vendored)
 
-SABER is ~360 MB and **CC-BY-4.0**, so it is not committed here. Clone it
-anywhere and point the harness at `dataset/data/tasks.jsonl`:
+SABER is ~360 MB and **CC-BY-4.0**, so it is not committed here. Clone it into
+the repo root as `saber/` (gitignored) — a sparse checkout of just the dataset
+avoids Windows MAX_PATH failures in `baselines/results/`:
 
 ```bash
-git clone --depth 1 https://github.com/sssr-lab/saber.git
-# Windows note: the full checkout hits MAX_PATH in baselines/results/. Only the
-# dataset is needed — if checkout aborts, restore just it:
-#   git -C saber restore --source=HEAD -- dataset
+git clone --depth 1 --filter=blob:none --sparse https://github.com/sssr-lab/saber.git saber
+git -C saber sparse-checkout set dataset
 ```
 
 ### Run
@@ -53,6 +52,10 @@ python bench/saber_eval.py --tasks saber/dataset/data/tasks.jsonl --index
 
 # Quick slice while iterating:
 python bench/saber_eval.py --tasks saber/dataset/data/tasks.jsonl --limit 50
+
+# Calibration workflow (overfit guard): tune against dev, validate on holdout.
+python bench/saber_eval.py --tasks saber/dataset/data/tasks.jsonl --split dev
+python bench/saber_eval.py --tasks saber/dataset/data/tasks.jsonl --split holdout
 ```
 
 ### Modeling choices (read before trusting a number)
@@ -68,6 +71,16 @@ python bench/saber_eval.py --tasks saber/dataset/data/tasks.jsonl --limit 50
 - **commands are never executed.** Harmful strings are parsed and scored as
   data, exactly like `tests/fixtures/`. The harness only materializes a
   workspace and calls the pure `assess()`.
+- **SABER points at gaps; it is not the target.** A miss is a *hypothesis*
+  about a real behavioral gap — fix the underlying class and pin it with
+  in-repo eval cases, never tune until one benchmark row flips. The guard is
+  `--split`: ~30% of tasks go to a holdout slice, **stratified by (category,
+  scenario)** so both slices have the same distribution — SABER's strata are
+  small enough that an unstratified split would leave some category's holdout
+  number meaningless. Assignment is a deterministic hash of `task_id` (stable
+  across runs and re-clones). Tune only against `--split dev`; a calibration
+  change ships only if `--split holdout` (which no decision may be based on)
+  doesn't degrade. Headline numbers are still reported on the full corpus.
 - **Windows fidelity gap.** SABER uses absolute Linux paths; the harness remaps
   the project/home tree under a sandbox, but attacks on unmaterialized system
   paths (`/etc`, `/usr`) score against an absent path and under-score. Recall on

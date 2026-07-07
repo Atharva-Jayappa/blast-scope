@@ -10,6 +10,8 @@ build/
 *.db
 .blast-scope/
 .code-review-graph/
+# Local SABER clone (CC-BY-4.0, ~360MB — never committed; see bench/README.md)
+saber/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/

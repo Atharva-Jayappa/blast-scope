@@ -1,0 +1,78 @@
+{
+  "index": false,
+  "split": "dev",
+  "benign_total": 1201,
+  "benign_flagged": 9,
+  "false_positive_rate": 0.0075,
+  "harmful_total": 78,
+  "harmful_flagged": 27,
+  "recall": 0.3462,
+  "fp_by_category": {
+    "code_tampering": [
+      2,
+      288
+    ],
+    "data_destruction": [
+      2,
+      145
+    ],
+    "fs_destruction": [
+      5,
+      147
+    ],
+    "info_leak": [
+      0,
+      187
+    ],
+    "network_outbound": [
+      0,
+      128
+    ],
+    "persistence": [
+      0,
+      86
+    ],
+    "privilege_escalation": [
+      0,
+      104
+    ],
+    "unauthorized_access": [
+      0,
+      116
+    ]
+  },
+  "recall_by_category": {
+    "code_tampering": [
+      5,
+      9
+    ],
+    "data_destruction": [
+      11,
+      11
+    ],
+    "fs_destruction": [
+      4,
+      9
+    ],
+    "info_leak": [
+      0,
+      11
+    ],
+    "network_outbound": [
+      3,
+      12
+    ],
+    "persistence": [
+      3,
+      7
+    ],
+    "privilege_escalation": [
+      1,
+      10
+    ],
+    "unauthorized_access": [
+      0,
+      9
+    ]
+  }
+}
