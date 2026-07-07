@@ -40,9 +40,11 @@ _ENGINES: dict[str, str] = {
     "sqlite3": "sqlite",
 }
 
-_DROP_RE = re.compile(r"\bDROP\s+(TABLE|DATABASE|SCHEMA|VIEW|INDEX)\b\s+(?:IF\s+EXISTS\s+)?([`\"\[]?\w+)", re.I)
-_TRUNCATE_RE = re.compile(r"\bTRUNCATE\s+(?:TABLE\s+)?([`\"\[]?\w+)", re.I)
-_DELETE_RE = re.compile(r"\bDELETE\s+FROM\s+([`\"\[]?\w+)", re.I)
+# Possibly schema-qualified object name: `users`, `analytics.users`, `main."users"`.
+_QNAME = r"((?:[`\"\[]?\w+[`\"\]]?\s*\.\s*)*[`\"\[]?\w+)"
+_DROP_RE = re.compile(r"\bDROP\s+(TABLE|DATABASE|SCHEMA|VIEW|INDEX)\b\s+(?:IF\s+EXISTS\s+)?" + _QNAME, re.I)
+_TRUNCATE_RE = re.compile(r"\bTRUNCATE\s+(?:TABLE\s+)?" + _QNAME, re.I)
+_DELETE_RE = re.compile(r"\bDELETE\s+FROM\s+" + _QNAME, re.I)
 _WHERE_RE = re.compile(r"\bWHERE\b", re.I)
 # A WHERE that still removes (nearly) everything — a scoped DELETE this is not.
 # `WHERE rowid NOT IN (SELECT MIN(rowid) ...)` keeps one row per group; `1=1`
@@ -146,11 +148,15 @@ def _classify_sql(sql: str) -> str | None:
 
 
 def _target_table(sql: str) -> str:
-    """Best-effort table/object name the statement targets."""
+    """Best-effort table/object name the statement targets.
+
+    Schema qualifiers are dropped (``analytics.users`` → ``users``) so the
+    sqlite probe looks up the actual table name in ``sqlite_master``.
+    """
     for rx in (_DROP_RE, _TRUNCATE_RE, _DELETE_RE):
         m = rx.search(sql)
         if m:
-            return m.group(m.lastindex).strip("`\"[]")
+            return m.group(m.lastindex).split(".")[-1].strip().strip("`\"[]")
     return "the target"
 
 
@@ -227,7 +233,7 @@ def _sqlite_probe(cwd: Path, dbfile: str, table: str) -> tuple[bool, bool | None
 
 # WHERE-scoped DELETE → SELECT count(*) rewrite (single-table only).
 _SCOPED_DELETE_RE = re.compile(
-    r"^\s*DELETE\s+FROM\s+([`\"\[]?\w+[`\"\]]?)\s+(WHERE\b.*?)\s*;?\s*$",
+    r"^\s*DELETE\s+FROM\s+" + _QNAME + r"\s+(WHERE\b.*?)\s*;?\s*$",
     re.I | re.S,
 )
 _LIMIT_RE = re.compile(r"\bLIMIT\s+(\d+)\s*$", re.I)

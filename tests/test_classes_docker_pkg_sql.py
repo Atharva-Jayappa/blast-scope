@@ -150,6 +150,10 @@ class TestSqlTriage:
             ('mysql -e "TRUNCATE events"', "truncate"),
             ('psql -c "DELETE FROM logs"', "delete_all"),
             ('sqlite3 app.db "DROP TABLE users"', "drop"),
+            # Schema-qualified names must classify the same as bare ones.
+            ('psql -c "DROP TABLE analytics.users"', "drop"),
+            ('mysql -e "TRUNCATE TABLE prod.events"', "truncate"),
+            ('sqlite3 app.db "DELETE FROM main.users"', "delete_all"),
         ],
     )
     def test_destructive_sql(self, raw: str, op: str, tmp_path: Path) -> None:
@@ -188,6 +192,20 @@ class TestSqlAssess:
         assert c is not None and c.estimated is False
         assert "42" in c.evidence
         assert c.floor >= 0.85  # critical: schema + rows, irreversible
+
+    def test_sqlite_probe_resolves_schema_qualified_table(self, tmp_path: Path) -> None:
+        # `DROP TABLE main.users` must probe `users`, not a table named
+        # `main` — the old regex extracted the schema and the probe then
+        # reported "does not exist — nothing to lose" (0.2 under-score).
+        db = tmp_path / "app.db"
+        _make_sqlite(db, rows=42)
+        c = SqlClass().assess(
+            Candidate("sql", "drop", 'sqlite3 app.db "DROP TABLE main.users"', ("sqlite", "app.db")),
+            tmp_path,
+        )
+        assert c is not None and c.estimated is False
+        assert "42" in c.evidence
+        assert c.floor >= 0.85
 
     def test_sqlite_missing_table_is_low(self, tmp_path: Path) -> None:
         db = tmp_path / "app.db"
