@@ -1,0 +1,82 @@
+name: Rung 3 pilot
+
+# Manual only — runs the judge-vs-grounded disagreement pilot on the ubuntu
+# runner (the grounded arm needs the Linux overlay sandbox the dev box lacks).
+# The judge arm runs only if an OPENROUTER_API_KEY repo secret is set; without
+# it the workflow still produces grounded labels + the stability/coverage probes.
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: "number of scenarios"
+        default: "500"
+      seed:
+        description: "scenario seed"
+        default: "0"
+      model:
+        description: "OpenRouter model for the judge arm"
+        default: "deepseek/deepseek-chat"
+
+jobs:
+  pilot:
+    name: judge vs grounded
+    runs-on: ubuntu-latest
+    env:
+      # Job-level so the `if:` guards below can see whether the secret is set.
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+
+      - name: Best-effort enable unprivileged namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+
+      - name: Fail early if the overlay sandbox is unavailable
+        run: |
+          uv run python - << 'EOF'
+          from blast_scope import speculate
+          if not speculate.available():
+              raise SystemExit("overlay sandbox unavailable — grounded arm cannot run")
+          print("overlay sandbox available")
+          EOF
+
+      - name: Generate scenarios
+        run: |
+          uv run python -m bench.rung3_pilot.run_pilot generate \
+            --n "${{ inputs.n }}" --seed "${{ inputs.seed }}" --out scenarios.json
+
+      - name: Grounded arm (overlay sandbox)
+        env:
+          BLAST_SCOPE_SPECULATE: "1"
+        run: |
+          uv run python -m bench.rung3_pilot.run_pilot grounded \
+            --scenarios scenarios.json --out grounded.json
+
+      - name: Judge arm (OpenRouter)
+        if: ${{ env.OPENROUTER_API_KEY != '' }}
+        run: |
+          uv run python -m bench.rung3_pilot.run_pilot judge \
+            --scenarios scenarios.json --out judge.json --model "${{ inputs.model }}"
+
+      - name: Compare + verdict
+        if: ${{ env.OPENROUTER_API_KEY != '' }}
+        run: |
+          uv run python -m bench.rung3_pilot.run_pilot compare \
+            --scenarios scenarios.json --grounded grounded.json \
+            --judge judge.json --out report.json
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rung3-pilot-results
+          path: |
+            scenarios.json
+            grounded.json
+            judge.json
+            report.json
+          if-no-files-found: warn
