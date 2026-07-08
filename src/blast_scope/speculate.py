@@ -344,13 +344,25 @@ def _overlay_script_lower(
     ``set -e`` up to the mount so a mount failure aborts with nonzero; the
     user command itself must NOT abort the script (we want its exit code, and
     a failing command still produced a real diff), so it runs after ``set +e``.
+
+    The mount is attempted with ``userxattr`` first, falling back to a plain
+    overlay. ``userxattr`` makes overlayfs record whiteouts as a ``user.overlay``
+    xattr instead of a ``mknod`` character device — and device-node creation is
+    forbidden inside the unprivileged user namespace this runs in. Without it,
+    removing a *directory* from the lower layer fails with EIO on kernels that
+    enforce that rule (WSL2, rootless containers, hardened hosts), so the
+    flagship ``rm -rf ./somedir`` case would observe *nothing*. Kernels that
+    don't support ``userxattr`` fall back to the char-device form.
     """
     q = _shq
+    base = (
+        f"mount -t overlay overlay -o "
+        f"lowerdir={q(str(lower))},upperdir={q(str(upper))},workdir={q(str(work))}"
+    )
     return (
         "set -e\n"
-        f"mount -t overlay overlay -o "
-        f"lowerdir={q(str(lower))},upperdir={q(str(upper))},workdir={q(str(work))} "
-        f"{q(str(merged))}\n"
+        f"{base},userxattr {q(str(merged))} 2>/dev/null || "
+        f"{base} {q(str(merged))}\n"
         f"cd {q(str(merged))}\n"
         "set +e\n"
         f"{command}\n"
@@ -411,7 +423,9 @@ def diff_upper(
                 st = os.lstat(full)
             except OSError:
                 continue
-            kind = classify_upper_entry(st, (lower / rel).exists())
+            kind = classify_upper_entry(
+                st, (lower / rel).exists(), _has_whiteout_xattr(full)
+            )
             if kind == "deleted":
                 deleted.append(rel)
             elif kind == "created":
@@ -429,11 +443,34 @@ def diff_upper(
     )
 
 
-def classify_upper_entry(st: os.stat_result, exists_in_lower: bool) -> str:
+def _has_whiteout_xattr(path: Path) -> bool:
+    """True if ``path`` carries the ``user.overlay.whiteout`` xattr.
+
+    ``userxattr``-mode overlays record a deletion as a 0-byte regular file
+    tagged with this xattr instead of a char device. Linux-only; returns False
+    where ``os.getxattr`` is unavailable (e.g. the Windows dev box, which never
+    walks a real overlay).
+    """
+    getxattr = getattr(os, "getxattr", None)
+    if getxattr is None:
+        return False
+    try:
+        getxattr(path, "user.overlay.whiteout", follow_symlinks=False)
+        return True
+    except OSError:
+        return False
+
+
+def classify_upper_entry(
+    st: os.stat_result, exists_in_lower: bool, whiteout_xattr: bool = False
+) -> str:
     """Classify one upperdir entry from its lstat + lower-layer presence.
 
     Pure and platform-agnostic (takes a stat result, does no I/O) so the
     overlay vocabulary can be unit-tested without root or a real overlay.
+    ``whiteout_xattr`` flags the ``userxattr`` whiteout form (a 0-byte file
+    carrying ``user.overlay.whiteout``); the char-device form is detected from
+    ``st`` directly.
 
     Returns ``"deleted"`` (whiteout), ``"created"``, ``"modified"``, or
     ``"skip"`` (directories that merely exist in both layers — a passthrough,
@@ -447,7 +484,10 @@ def classify_upper_entry(st: os.stat_result, exists_in_lower: bool) -> str:
         'deleted'
     """
     mode = st.st_mode
-    # Whiteout: character device with device number 0.
+    # Whiteout: char device with device number 0 (default), or a file tagged
+    # with the user.overlay.whiteout xattr (userxattr mode).
+    if whiteout_xattr:
+        return "deleted"
     if stat.S_ISCHR(mode) and st.st_rdev == 0:
         return "deleted"
     if stat.S_ISDIR(mode):

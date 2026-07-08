@@ -97,6 +97,12 @@ class TestClassifyUpperEntry:
         st = _FakeStat(stat.S_IFCHR, rdev=42)
         assert classify_upper_entry(st, exists_in_lower=True) == "modified"
 
+    def test_userxattr_whiteout_is_deleted(self) -> None:
+        # userxattr mode records a deletion as a plain file carrying the
+        # user.overlay.whiteout xattr, not a char device — must read as deleted.
+        st = _FakeStat(stat.S_IFREG)
+        assert classify_upper_entry(st, exists_in_lower=True, whiteout_xattr=True) == "deleted"
+
     def test_regular_file_in_lower_is_modified(self) -> None:
         st = _FakeStat(stat.S_IFREG)
         assert classify_upper_entry(st, exists_in_lower=True) == "modified"
