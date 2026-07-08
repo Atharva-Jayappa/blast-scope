@@ -99,18 +99,22 @@ def cmd_grounded(args) -> None:
 
 def cmd_judge(args) -> None:
     scen = _load_scenarios(Path(args.scenarios))
+    contents = args.context == "full"
     if args.mock:
         results = [_mock_judge(s) for s in scen]
     else:
         from . import judge
-        results = [r.__dict__ for r in judge.run(scen, model=args.model)]
+        results = [
+            r.__dict__
+            for r in judge.run(scen, model=args.model, contents=contents, workers=args.workers)
+        ]
     out = {r["id"]: r for r in results}
     Path(args.out).write_text(json.dumps(out, indent=2))
     labels: dict[str, int] = {}
     for r in results:
         labels[r["label"]] = labels.get(r["label"], 0) + 1
-    print(f"judge ({args.model if not args.mock else 'mock'}): "
-          f"{len(results)} scenarios → {args.out}")
+    tag = "mock" if args.mock else f"{args.model} / {args.context}-context"
+    print(f"judge ({tag}): {len(results)} scenarios → {args.out}")
     for k in sorted(labels):
         print(f"  {k:<10} {labels[k]}")
 
@@ -217,6 +221,10 @@ def main(argv: list[str] | None = None) -> int:
     j.add_argument("--scenarios", required=True)
     j.add_argument("--out", default="judge.json")
     j.add_argument("--model", default="deepseek/deepseek-chat")
+    j.add_argument("--context", choices=("full", "listing"), default="full",
+                   help="full = judge sees file contents; listing = names + git state only")
+    j.add_argument("--workers", type=int, default=8,
+                   help="concurrent API requests (lower for rate-limited cheap models)")
     j.add_argument("--mock", action="store_true")
     j.set_defaults(func=cmd_judge)
 

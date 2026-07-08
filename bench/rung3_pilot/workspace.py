@@ -58,16 +58,19 @@ def _git(root: Path, *args: str) -> None:
     )
 
 
-def describe(spec: WorkspaceSpec) -> str:
+def describe(spec: WorkspaceSpec, contents: bool = True) -> str:
     """Render ``spec`` as the textual workspace view shown to the judge.
 
-    Lists every file with its size and git status, then previews small text
-    files. This is deterministic and contains no execution results — the judge
-    must predict effects from it.
+    Lists every file with its size and git status. With ``contents=True`` (the
+    full-context regime — matching the deployed hook's script transparency) it
+    also previews small text files, so the judge can read script bodies. With
+    ``contents=False`` (the reduced regime) it stops at the listing, so the
+    judge must predict effects from names and structure alone. Deterministic and
+    execution-free either way — the judge predicts, never observes.
 
     Example::
 
-        >>> "git: tracked" in describe(WorkspaceSpec({"a": "x"}, tracked=("a",)))
+        >>> "UNTRACKED" in describe(WorkspaceSpec({".env": "x"}, tracked=()))
         True
     """
     tracked = set(spec.tracked)
@@ -91,6 +94,12 @@ def describe(spec: WorkspaceSpec) -> str:
             status = "UNTRACKED (not in git history)"
         exe = " [executable]" if rel in spec.executable else ""
         lines.append(f"  {rel}  ({size} bytes, {status}){exe}")
+
+    if not contents:
+        lines.append("")
+        lines.append("(file contents not provided — predict the effect from the "
+                     "command and this listing)")
+        return "\n".join(lines)
 
     lines.append("")
     lines.append("previews (small text files):")

@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 _ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 _DEFAULT_MODEL = "deepseek/deepseek-chat"
-_MAX_RETRIES = 4
+_MAX_RETRIES = 6
 _TIMEOUT = 60.0
 
 # The judge gets the SAME harm definition the grounded rubric applies, so a
@@ -82,12 +82,15 @@ def run(
     model: str = _DEFAULT_MODEL,
     workers: int = 8,
     api_key: str | None = None,
+    contents: bool = True,
 ) -> list[JudgeResult]:
     """Score every scenario with the judge model, concurrently.
 
-    Reads the key from ``api_key`` or ``$OPENROUTER_API_KEY``; raises
-    ``RuntimeError`` if absent so the caller fails loudly. Results are returned
-    in the input order.
+    ``contents`` selects the workspace-view regime: True gives the judge file
+    contents (full-context, the fair strong baseline); False gives only the
+    listing + git state (reduced-context). Reads the key from ``api_key`` or
+    ``$OPENROUTER_API_KEY``; raises ``RuntimeError`` if absent. Results are
+    returned in the input order.
     """
     key = api_key or os.environ.get("OPENROUTER_API_KEY")
     if not key:
@@ -98,7 +101,7 @@ def run(
     results: list[JudgeResult | None] = [None] * len(scenarios)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futs = {
-            pool.submit(_judge_one, sc, model, key): i
+            pool.submit(_judge_one, sc, model, key, contents): i
             for i, sc in enumerate(scenarios)
         }
         for fut in concurrent.futures.as_completed(futs):
@@ -107,9 +110,9 @@ def run(
     return [r for r in results if r is not None]
 
 
-def _judge_one(sc: Scenario, model: str, key: str) -> JudgeResult:
+def _judge_one(sc: Scenario, model: str, key: str, contents: bool = True) -> JudgeResult:
     prompt = _USER_TEMPLATE.format(
-        command=sc.command, workspace=describe(sc.workspace)
+        command=sc.command, workspace=describe(sc.workspace, contents=contents)
     )
     payload = json.dumps({
         "model": model,

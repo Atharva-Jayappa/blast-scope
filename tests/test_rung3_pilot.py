@@ -122,6 +122,30 @@ class TestDescribe:
         ws = scenarios.WorkspaceSpec(files={"a.txt": "x"}, git=False)
         assert "NOT a git repository" in describe(ws)
 
+    def test_listing_mode_hides_contents(self) -> None:
+        ws = scenarios.WorkspaceSpec(
+            files={"cleanup.sh": "rm -f .env", ".env": "SECRET=x"},
+            tracked=(), executable=("cleanup.sh",),
+        )
+        full = describe(ws, contents=True)
+        listing = describe(ws, contents=False)
+        # the script body leaks the target only in full-context mode
+        assert "rm -f .env" in full
+        assert "rm -f .env" not in listing
+        assert "cleanup.sh" in listing  # the filename is still listed
+
+
+class TestHardFamilies:
+    def test_hard_families_present(self) -> None:
+        strata = {s.stratum for s in scenarios.generate(500, seed=0)}
+        for hard in ("glob_scope", "dynamic_target", "find_tracked", "conditional"):
+            assert hard in strata
+
+    def test_dynamic_target_hides_victim_in_command(self) -> None:
+        # the destructive target lives in the script + a data file, never the command
+        scen = [s for s in scenarios.generate(500, seed=0) if s.stratum == "dynamic_target"]
+        assert scen and all(s.command.startswith("bash ") for s in scen)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
