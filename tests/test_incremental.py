@@ -72,6 +72,49 @@ class TestIncrementalIndexing:
         after = r._get_store().get_stats().total_nodes
         assert after == before
 
+    def test_build_reports_whether_anything_changed(
+        self, project: Path, tmp_path: Path
+    ) -> None:
+        r = GraphResolver(project, db_path=tmp_path / "inc.db")
+        assert r.build_graph() is True  # first build parses everything
+        assert r.build_graph() is False  # nothing changed
+        (project / "config.py").write_text("# changed\nVALUE = 2\n")
+        assert r.build_graph() is True
+        (project / "db.py").unlink()
+        assert r.build_graph() is True  # prune counts as a change
+
+    def test_noop_rebuild_is_stat_only(self, project: Path, tmp_path: Path) -> None:
+        """An unchanged tree costs a stat sweep: no reads, no parse, no PageRank."""
+        r = _build(project, tmp_path)
+        parses: list[Path] = []
+        real_parse = r._parser.parse_file
+        r._parser.parse_file = lambda p: parses.append(p) or real_parse(p)  # type: ignore[method-assign]
+        recomputes: list[bool] = []
+        real_recompute = r._recompute_centrality
+        r._recompute_centrality = lambda s: recomputes.append(True) or real_recompute(s)  # type: ignore[method-assign]
+
+        assert r.build_graph() is False
+        assert parses == []
+        assert recomputes == []
+
+    def test_touched_but_identical_file_is_not_reparsed(
+        self, project: Path, tmp_path: Path
+    ) -> None:
+        """mtime bump with identical content falls through to the hash, not a parse."""
+        import os
+        import time
+
+        r = _build(project, tmp_path)
+        target = project / "config.py"
+        future = time.time() + 10
+        os.utime(target, (future, future))
+
+        parses: list[Path] = []
+        real_parse = r._parser.parse_file
+        r._parser.parse_file = lambda p: parses.append(p) or real_parse(p)  # type: ignore[method-assign]
+        assert r.build_graph() is False  # hash matched — content is the same
+        assert parses == []
+
 
 class TestImportance:
     def test_importance_populated(self, project: Path, tmp_path: Path) -> None:

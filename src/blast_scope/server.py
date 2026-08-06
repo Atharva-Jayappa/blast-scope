@@ -169,7 +169,10 @@ def assess(
     )
 
     resolutions_per_command: list = []
-    if project_root and (auto_index or _graph_exists(Path(project_root))):
+    graph_scored = bool(project_root) and (
+        auto_index or _graph_exists(Path(project_root))
+    )
+    if graph_scored:
         resolver = _get_resolver(Path(project_root), auto_index=auto_index)
         for parsed in parsed_list:
             resolutions_per_command.append(
@@ -289,7 +292,12 @@ def assess(
         consequences_per_command=consequences_per_command,
     )
 
-    return dict(assessment)
+    out = dict(assessment)
+    # Honesty flag: was the dependency graph consulted? A graphless verdict
+    # (fresh workspace, cold build still running) lacks the structural
+    # in-degree/centrality signal — callers surface that, not hide it.
+    out["graph_context"] = graph_scored
+    return out
 
 
 def _maybe_speculate(

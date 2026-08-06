@@ -26,6 +26,10 @@ _PAGERANK_META_KEY = "pagerank_by_file"
 # When present it is the authoritative blast-radius signal (in-degree + PageRank),
 # replacing the tree-sitter parser's name-matched edges.
 _IMPORT_GRAPH_META_KEY = "import_graph"
+# Per-file [st_mtime_ns, st_size] from the last build. Lets a rebuild skip
+# unchanged files on a stat alone — no read, no hash — which is what makes
+# refreshing the graph on every hook invocation affordable.
+_FILE_STATS_META_KEY = "file_stats"
 
 
 # ---------------------------------------------------------------------------
@@ -115,31 +119,54 @@ class GraphResolver:
             self._store = GraphStore(self._db_path)
         return self._store
 
-    def build_graph(self, force: bool = False) -> None:
+    def build_graph(self, force: bool = False) -> bool:
         """Parse the project's source files and populate the graph.
 
-        Incremental by default: files whose content hash is unchanged since
-        the last build are skipped, and files that have disappeared are
-        pruned. Pass ``force=True`` to re-parse everything. After (re)building,
-        weighted PageRank centrality is recomputed and cached.
+        Incremental by default, with a two-tier skip: a file whose mtime and
+        size match the last build is skipped on the stat alone (no read); a
+        file that fails that but hashes identically is skipped after the read.
+        Disappeared files are pruned. Pass ``force=True`` to re-parse
+        everything. Centrality (import graph + PageRank) is recomputed only
+        when something actually changed, so a no-op rebuild costs one stat
+        sweep — cheap enough to run before every scored command.
 
         Args:
-            force: Re-parse every file regardless of cached hashes.
+            force: Re-parse every file regardless of cached stats/hashes.
+
+        Returns:
+            True if any file was (re)parsed or pruned, False for a no-op.
 
         Example::
 
             >>> resolver = GraphResolver(Path("/project"))
             >>> resolver.build_graph()          # first run: parses everything
-            >>> resolver.build_graph()          # later: only changed files
+            True
+            >>> resolver.build_graph()          # nothing changed: stat sweep only
+            False
         """
         store = self._get_store()
         existing_hashes = store.get_file_hashes()
+        raw_stats = store.get_metadata(_FILE_STATS_META_KEY)
+        old_stats: dict[str, list[int]] = json.loads(raw_stats) if raw_stats else {}
+        new_stats: dict[str, list[int]] = {}
         seen: set[str] = set()
+        changed = False
 
         for source_file in self._walk_sources():
             rel_path = self._to_graph_path(source_file)
             seen.add(rel_path)
             try:
+                st = source_file.stat()
+                sig = [st.st_mtime_ns, st.st_size]
+                new_stats[rel_path] = sig
+                # Stat fast-path: same mtime+size as last build → skip without
+                # reading the file at all.
+                if (
+                    not force
+                    and old_stats.get(rel_path) == sig
+                    and rel_path in existing_hashes
+                ):
+                    continue
                 file_hash = hashlib.md5(
                     source_file.read_bytes(), usedforsecurity=False
                 ).hexdigest()
@@ -153,14 +180,24 @@ class GraphResolver:
                 store.store_file_nodes_edges(
                     rel_path, normalized_nodes, normalized_edges, fhash=file_hash
                 )
+                changed = True
             except Exception:
                 logger.warning("Failed to parse %s", source_file, exc_info=True)
 
         # Prune files that no longer exist on disk.
         for stale in existing_hashes.keys() - seen:
             store.remove_file_data(stale)
+            changed = True
 
-        self._recompute_centrality(store)
+        if new_stats != old_stats:
+            store.set_metadata(_FILE_STATS_META_KEY, json.dumps(new_stats))
+
+        # Centrality is the expensive tail — skip it when the graph is
+        # byte-identical to last build and a cached PageRank already exists
+        # (absent on DBs from before the stat fast-path).
+        if force or changed or store.get_metadata(_PAGERANK_META_KEY) is None:
+            self._recompute_centrality(store)
+        return changed
 
     def _recompute_centrality(self, store: GraphStore) -> None:
         """Recompute the precise import graph and file-level PageRank.

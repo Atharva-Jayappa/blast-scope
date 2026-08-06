@@ -54,11 +54,29 @@ Bash command ──▶ PreToolUse hook ──▶ assess() ──▶ score
                                           └─▶ additionalContext (risk + snapshot id)
 ```
 
-The hook entry point is `python -m blast_scope.hook`. It reads the PreToolUse
-JSON on stdin and writes hook output on stdout. To keep per-command latency
-low it uses the dependency graph **only if one is already built**
-(`<root>/.blast-scope/graph.db`); it never triggers a graph build. Run
-`index_project` (or the MCP tool) once to enable graph-aware scoring.
+The hook entry point is `python -m blast_scope.hook`. It reads the hook JSON
+on stdin, dispatches on the event, and writes hook output on stdout.
+
+## Graph freshness
+
+The dependency graph no longer depends on anyone calling the MCP server —
+the hooks keep it existing and current on their own:
+
+- **SessionStart** spawns a *detached* background process that cold-builds
+  the graph (`<root>/.blast-scope/graph.db`), so the expensive first index
+  happens off the command path.
+- **PreToolUse** refreshes the graph *incrementally* before scoring. When
+  nothing changed this is a stat sweep (mtime+size — no file reads, no
+  centrality recompute); when files changed, only those are re-parsed. Every
+  verdict therefore scores against the current tree, even after a burst of
+  agent edits that never passed through the Bash hook.
+
+Concurrent sessions coordinate through a lockfile
+(`<root>/.blast-scope/graph.lock`); a contended refresh is skipped, never
+waited on. While a cold build is still running, verdicts score graphless and
+say so — advisories carry a "no dependency graph yet" note (`graph_context:
+false` in the assessment) instead of presenting a blind verdict as a fully
+informed one.
 
 ## Registration
 
@@ -67,6 +85,13 @@ Add to `.claude/settings.json` (project) or `~/.claude/settings.json` (global):
 ```json
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python -m blast_scope.hook" }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",

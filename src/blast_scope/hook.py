@@ -1,9 +1,9 @@
-"""PreToolUse hook: severity-tiered advisory + automatic snapshot.
+"""PreToolUse + SessionStart hook: severity-tiered advisory + automatic snapshot.
 
-Registered as a Claude Code ``PreToolUse`` hook on the ``Bash`` tool, this
-reads the tool payload on stdin and scores the command. It is **advisory** —
-it never blocks — and its volume scales with stakes so the rare loud message
-keeps its signal:
+Registered as a Claude Code hook, this reads the payload on stdin and
+dispatches on the event. On ``PreToolUse`` (``Bash`` tool) it scores the
+command. It is **advisory** — it never blocks — and its volume scales with
+stakes so the rare loud message keeps its signal:
 
 - **low / medium** — silent. The common case stays quiet; constant low-value
   advice is what trains everyone to ignore the advisory entirely.
@@ -11,10 +11,18 @@ keeps its signal:
 - **critical** — surfaces the assessment *and* captures an undo snapshot of the
   paths the command would destroy, so a mistake is reversible.
 
+Graph freshness rides on the same two events (see :mod:`blast_scope.indexing`):
+``SessionStart`` kicks off a detached cold index so the graph exists without
+anyone calling the MCP server, and each ``PreToolUse`` refreshes it
+incrementally before scoring so mid-session edits can't stale the verdict.
+
 Register in ``settings.json`` (see ``docs/hook.md``)::
 
-    "hooks": {"PreToolUse": [{"matcher": "Bash",
-      "hooks": [{"type": "command", "command": "python -m blast_scope.hook"}]}]}
+    "hooks": {
+      "SessionStart": [{"hooks":
+        [{"type": "command", "command": "python -m blast_scope.hook"}]}],
+      "PreToolUse": [{"matcher": "Bash",
+        "hooks": [{"type": "command", "command": "python -m blast_scope.hook"}]}]}
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ import os
 import sys
 from pathlib import Path
 
+from blast_scope import indexing
 from blast_scope import snapshot as snapshot_engine
 from blast_scope.server import assess
 
@@ -67,6 +76,11 @@ def run(payload: dict) -> dict:
 
     cwd = payload.get("cwd") or os.getcwd()
     project_root = os.environ.get("BLAST_SCOPE_PROJECT_ROOT") or cwd
+
+    # Keep the graph honest before scoring: incremental refresh when one
+    # exists (a stat sweep when nothing changed), detached cold build when
+    # none does. Non-blocking and never raises — scoring proceeds either way.
+    indexing.ensure_fresh_graph(Path(project_root))
 
     # auto_index=False: a hook must be fast — use the graph only if already built.
     try:
@@ -114,13 +128,34 @@ def run(payload: dict) -> dict:
 _MAX_STDIN_BYTES: int = 8 * 1024 * 1024
 
 
+def run_session_start(payload: dict) -> dict:
+    """Kick off a detached background graph build for the session's project.
+
+    Returns ``{}`` always — session start has nothing to tell the agent; the
+    build (if one was needed) runs off the command path so the first scored
+    commands find a graph waiting.
+
+    Example::
+
+        >>> run_session_start({"cwd": "/proj"})
+        {}
+    """
+    cwd = payload.get("cwd") or os.getcwd()
+    project_root = os.environ.get("BLAST_SCOPE_PROJECT_ROOT") or cwd
+    indexing.spawn_background_build(Path(project_root))
+    return {}
+
+
 def main() -> None:
-    """Entry point: read PreToolUse JSON on stdin, emit hook output on stdout."""
+    """Entry point: read hook JSON on stdin, dispatch on event, emit output."""
     try:
         payload = json.loads(sys.stdin.read(_MAX_STDIN_BYTES))
     except (json.JSONDecodeError, ValueError):
         sys.exit(0)  # malformed input — stay out of the way
-    out = run(payload)
+    if payload.get("hook_event_name") == "SessionStart":
+        out = run_session_start(payload)
+    else:
+        out = run(payload)
     if out:
         json.dump(out, sys.stdout)
     sys.exit(0)
@@ -167,6 +202,12 @@ def _format(
         lines.append(
             f"⚠ NOT snapshotted (too large to archive safely): {names}. "
             f"This deletion is not undoable via blast-scope — proceed with care."
+        )
+
+    if assessment.get("graph_context") is False:
+        lines.append(
+            "Note: no dependency graph yet (building in background) — "
+            "structural blast-radius signal unavailable for this verdict."
         )
     return "\n".join(lines)
 
