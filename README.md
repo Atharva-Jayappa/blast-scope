@@ -191,17 +191,26 @@ Tools exposed:
 | `list_snapshots(project_root)` | List undo snapshots, newest first. |
 | `restore_snapshot(snapshot_id, project_root)` | Undo a risky command by restoring its snapshot. |
 
-### As a PreToolUse hook (tiered advice + auto-snapshot)
+### As a hook (tiered advice + auto-snapshot)
 
 Intercept Bash commands *before* they run — advisory, never blocking. Volume
 scales with stakes: **silent** on low/medium, **advise** on high, **advise +
 snapshot** on critical. The snapshot skips what's already recoverable
 (git-clean, regenerable) and warns rather than tars anything over a hard size
-cap, so the undo net stays fast and trustworthy. Add to `.claude/settings.json`:
+cap, so the undo net stays fast and trustworthy.
+
+The hooks also keep the dependency graph alive on their own — no MCP call
+needed: `SessionStart` cold-builds it in a detached background process, and
+every `PreToolUse` refreshes it incrementally before scoring (a ~20 ms stat
+sweep when nothing changed), so verdicts track the current tree even after a
+burst of agent edits. Add to `.claude/settings.json`:
 
 ```json
 {
   "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "python -m blast_scope.hook" }] }
+    ],
     "PreToolUse": [
       { "matcher": "Bash",
         "hooks": [{ "type": "command", "command": "python -m blast_scope.hook" }] }
