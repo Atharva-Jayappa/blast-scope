@@ -16,12 +16,11 @@ unreachable, the class degrades to a heuristic floor and labels it ``estimated``
 from __future__ import annotations
 
 import logging
-import shlex
 import subprocess
 from pathlib import Path
 
 from blast_scope.classes import Candidate
-from blast_scope.command_parser import ParsedCommand
+from blast_scope.command_parser import ParsedCommand, peeled_tokens
 from blast_scope.consequences import Consequence
 
 logger = logging.getLogger(__name__)
@@ -74,15 +73,10 @@ class DockerClass:
 
 def _parse_docker(raw: str) -> tuple[str, str, list[str], list[str]] | None:
     """Split a docker command into (object, action, args, flags)."""
-    try:
-        tokens = shlex.split(raw)
-    except ValueError:
-        tokens = raw.split()
-    if not tokens:
-        return None
-    if tokens[0] == "sudo" and len(tokens) >= 2 and tokens[1] == "docker":
-        tokens = tokens[1:]
-    if not tokens or tokens[0] != "docker":
+    # Peel env-assignment/exec-wrapper prefixes (`FOO=bar docker …`, `sudo
+    # docker …`, `env docker …`) so a prefix can't hide the docker verb.
+    tokens = peeled_tokens(raw)
+    if not tokens or tokens[0].rsplit("/", 1)[-1] != "docker":
         return None
 
     rest = tokens[1:]

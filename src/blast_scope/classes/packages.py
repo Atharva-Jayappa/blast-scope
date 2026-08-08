@@ -14,11 +14,10 @@ so it never degrades to an estimate. Deleting ``.venv`` itself is deliberately
 from __future__ import annotations
 
 import logging
-import shlex
 from pathlib import Path
 
 from blast_scope.classes import Candidate
-from blast_scope.command_parser import ParsedCommand
+from blast_scope.command_parser import ParsedCommand, peeled_tokens
 from blast_scope.consequences import Consequence
 
 logger = logging.getLogger(__name__)
@@ -74,10 +73,9 @@ class PackagesClass:
 
 
 def _tokens(raw: str) -> list[str]:
-    try:
-        return shlex.split(raw)
-    except ValueError:
-        return raw.split()
+    # Peel env-assignment/exec-wrapper prefixes so `FOO=bar pip uninstall …`
+    # and `env uv pip uninstall …` still match the positional triage below.
+    return peeled_tokens(raw)
 
 
 def _packages_after(tokens: list[str], keyword: str) -> tuple[str, ...]:

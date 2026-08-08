@@ -28,12 +28,11 @@ The rewritten command runs with a hard timeout and is the ONLY thing executed
 from __future__ import annotations
 
 import logging
-import shlex
 import subprocess
 from pathlib import Path
 
 from blast_scope.classes import Candidate
-from blast_scope.command_parser import ParsedCommand
+from blast_scope.command_parser import ParsedCommand, peeled_tokens
 from blast_scope.consequences import Consequence
 
 logger = logging.getLogger(__name__)
@@ -116,10 +115,10 @@ class FindClass:
 
 
 def _tokens(raw: str) -> list[str]:
-    try:
-        return shlex.split(raw)
-    except ValueError:
-        return raw.split()
+    # Peel env-assignment/exec-wrapper prefixes so `FOO=bar find … -delete`
+    # still reaches the -print oracle rather than bailing at the tokens[0]
+    # match and falling back to weaker static scoring.
+    return peeled_tokens(raw)
 
 
 def _roots_within_cwd(argv: list[str], cwd: Path) -> bool:

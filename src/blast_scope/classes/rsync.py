@@ -22,12 +22,11 @@ from __future__ import annotations
 
 import logging
 import re
-import shlex
 import subprocess
 from pathlib import Path
 
 from blast_scope.classes import Candidate
-from blast_scope.command_parser import ParsedCommand
+from blast_scope.command_parser import ParsedCommand, peeled_tokens
 from blast_scope.consequences import Consequence
 
 logger = logging.getLogger(__name__)
@@ -116,10 +115,10 @@ class RsyncClass:
 
 
 def _tokens(raw: str) -> list[str]:
-    try:
-        return shlex.split(raw)
-    except ValueError:
-        return raw.split()
+    # Peel env-assignment/exec-wrapper prefixes so `FOO=bar rsync --delete …`
+    # yields tokens starting at `rsync`: otherwise the prefix is read as an
+    # endpoint and the executed dry-run probe starts with the assignment.
+    return peeled_tokens(raw)
 
 
 def _run_rsync(argv: list[str], cwd: Path) -> str | None:

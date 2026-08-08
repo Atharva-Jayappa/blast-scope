@@ -21,12 +21,11 @@ from __future__ import annotations
 
 import logging
 import re
-import shlex
 import sqlite3
 from pathlib import Path
 
 from blast_scope.classes import Candidate
-from blast_scope.command_parser import ParsedCommand
+from blast_scope.command_parser import ParsedCommand, peeled_tokens
 from blast_scope.consequences import Consequence
 
 logger = logging.getLogger(__name__)
@@ -109,10 +108,10 @@ class SqlClass:
 
 def _extract_sql(raw: str, engine: str) -> tuple[str | None, str | None]:
     """Pull the SQL statement (and a sqlite db path) out of a client command."""
-    try:
-        tokens = shlex.split(raw)
-    except ValueError:
-        tokens = raw.split()
+    # Peel env-assignment/exec-wrapper prefixes so `FOO=bar sqlite3 db 'DROP…'`
+    # yields tokens starting at the client verb — otherwise positional operand
+    # extraction reads the prefix as the db file and the SQL is lost.
+    tokens = peeled_tokens(raw)
     if not tokens:
         return (None, None)
 

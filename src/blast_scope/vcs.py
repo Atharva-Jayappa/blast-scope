@@ -14,7 +14,7 @@ import shlex
 from pathlib import Path
 
 from blast_scope.consequences import Consequence
-from blast_scope.command_parser import ParsedCommand
+from blast_scope.command_parser import ParsedCommand, peeled_tokens
 from blast_scope.recoverability import working_tree_state
 
 logger = logging.getLogger(__name__)
@@ -134,16 +134,12 @@ def destructive_op(sub: str | None, flags: list[str], raw: str) -> str | None:
 
 def _subcommand(raw: str) -> tuple[str | None, list[str]]:
     """Extract the git subcommand and flags from a raw command string."""
-    try:
-        tokens = shlex.split(raw)
-    except ValueError:
-        tokens = raw.split()
-    if not tokens or tokens[0] != "git":
-        # tolerate a leading "sudo"
-        if len(tokens) >= 2 and tokens[0] == "sudo" and tokens[1] == "git":
-            tokens = tokens[1:]
-        else:
-            return (None, [])
+    # Peel env-assignment/exec-wrapper prefixes so `FOO=bar git …`, `sudo git
+    # …`, and `env git …` all classify as git — a prefix must not hide the
+    # destructive subcommand from this positional match.
+    tokens = peeled_tokens(raw)
+    if not tokens or tokens[0].rsplit("/", 1)[-1] != "git":
+        return (None, [])
     rest = tokens[1:]
     sub: str | None = None
     flags: list[str] = []

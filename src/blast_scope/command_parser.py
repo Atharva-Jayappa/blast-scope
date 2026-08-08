@@ -141,9 +141,12 @@ def parse_command(
     if idx >= len(tokens):
         return _empty_result()
 
-    # Canonicalize PowerShell/cmd verbs (Remove-Item → rm) so the rest of the
-    # pipeline is shell-agnostic.
-    base_command = canonicalize(tokens[idx])
+    # Basename then canonicalize the verb: an absolute/relative path
+    # (`/usr/bin/git`, `./rm`) must classify as its verb, or the class oracles
+    # and command-effect table — which key off `command` — silently disengage
+    # and the score collapses (`/bin/rm -rf x` scored LOW). Canonicalize maps
+    # PowerShell/cmd aliases (Remove-Item → rm) so the pipeline is shell-agnostic.
+    base_command = canonicalize(_verb_basename(tokens[idx]))
     remaining = tokens[idx + 1 :]
 
     # Separate flags from positional arguments
@@ -397,6 +400,22 @@ def parse_chain_with_segments(
 # Assignment prefix: FOO=1, PYTHONPATH=/x, etc.
 _ASSIGNMENT_RE: re.Pattern[str] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
+
+def _verb_basename(token: str) -> str:
+    """Strip any directory prefix from a command token (POSIX or Windows path).
+
+    The verb, not its location, drives classification: ``/usr/bin/git`` and
+    ``git`` must classify identically.
+
+    Example::
+
+        >>> _verb_basename("/usr/bin/git")
+        'git'
+        >>> _verb_basename(r"C:\\tools\\rm.exe")
+        'rm.exe'
+    """
+    return token.replace("\\", "/").rsplit("/", 1)[-1]
+
 # Transparent exec-wrappers: they run the command that follows, so the real
 # verb is behind them. Peeled the same way as sudo so a destructive command
 # can't hide behind `env`/`timeout`/`xargs`/…
@@ -466,6 +485,30 @@ def _strip_prefixes(tokens: list[str]) -> int:
     return idx
 
 
+def peeled_tokens(raw: str) -> list[str]:
+    """Tokenize ``raw`` and drop the wrapper/assignment prefix.
+
+    Returns the tokens from the real command onward, so ``tokens[0]`` is the
+    verb the kernel would run — ``env FOO=1 git clean -fdx`` → ``["git",
+    "clean", "-fdx"]``. The command-class analyzers tokenize on this rather
+    than the raw string, so an env prefix (``FOO=bar git …``) or exec-wrapper
+    can't slip a destructive command past their positional ``tokens[0]``
+    matching. Empty when the command is only prefix.
+
+    Example::
+
+        >>> peeled_tokens("FOO=bar git clean -fdx")
+        ['git', 'clean', '-fdx']
+        >>> peeled_tokens("env NODE_ENV=prod sqlite3 app.db 'DROP TABLE t'")
+        ['sqlite3', 'app.db', 'DROP TABLE t']
+    """
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        tokens = raw.split()
+    return tokens[_strip_prefixes(tokens):]
+
+
 def real_command_verb(raw: str) -> str:
     """The real command verb of ``raw`` after peeling wrappers/assignments.
 
@@ -477,14 +520,10 @@ def real_command_verb(raw: str) -> str:
         >>> real_command_verb("env NODE_ENV=prod rm -rf src")
         'rm'
     """
-    try:
-        tokens = shlex.split(raw)
-    except ValueError:
-        tokens = raw.split()
-    idx = _strip_prefixes(tokens)
-    if idx >= len(tokens):
+    tokens = peeled_tokens(raw)
+    if not tokens:
         return ""
-    return canonicalize(tokens[idx].rsplit("/", 1)[-1])
+    return canonicalize(_verb_basename(tokens[0]))
 
 
 def _empty_result() -> ParsedCommand:
